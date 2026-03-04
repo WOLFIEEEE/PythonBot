@@ -160,8 +160,11 @@ class StrategyEngine:
         # Track last signals per instrument for dashboard
         self.last_signals: dict[str, dict[str, Any]] = {}
 
-        # Strategy weights (can be customised)
+        # Strategy weights (can be customised, updated by AdaptiveEngine)
         self._weights: dict[str, float] = {}
+
+        # Optional reference to AdaptiveEngine for regime-aware weight boosts
+        self._adaptive_engine: Any = None
 
     # ── Session-based strategy filtering ────────────────────────────
     def _get_active_strategies(self) -> list[type[BaseStrategy]]:
@@ -229,8 +232,19 @@ class StrategyEngine:
 
         buy_count = len(buy_signals)
         sell_count = len(sell_signals)
-        buy_score = sum(s.strength * self._weights.get(s.strategy_name, 1.0) for s in buy_signals)
-        sell_score = sum(s.strength * self._weights.get(s.strategy_name, 1.0) for s in sell_signals)
+
+        # Compute weighted scores with optional regime boost from adaptive engine
+        def _effective_weight(strategy_name: str) -> float:
+            base = self._weights.get(strategy_name, 1.0)
+            if self._adaptive_engine:
+                boost = self._adaptive_engine.get_regime_weight_boost(
+                    strategy_name, regime.value,
+                )
+                return base * boost
+            return base
+
+        buy_score = sum(s.strength * _effective_weight(s.strategy_name) for s in buy_signals)
+        sell_score = sum(s.strength * _effective_weight(s.strategy_name) for s in sell_signals)
 
         # 4. Regime-adaptive threshold
         threshold = self._regime_threshold(regime)

@@ -3,7 +3,7 @@ Main orchestrator — authentication, data feed, strategy evaluation,
 order lifecycle, risk management, and scheduled square-off.
 
 Hardened with: market-day check, thread safety, emergency exits,
-external close detection, stale data skipping.
+external close detection, stale data skipping, auto-evolution.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import settings
 from core.auth import authenticate
+from core.adaptive_engine import AdaptiveEngine
 from core.data_feed import DataFeed
 from core.order_manager import OrderManager
 from core.position_tracker import PositionTracker
@@ -56,6 +57,7 @@ risk_mgr: RiskManager | None = None
 pos_tracker: PositionTracker | None = None
 data_feed: DataFeed | None = None
 strategy_engine: StrategyEngine | None = None
+adaptive: AdaptiveEngine | None = None
 scheduler: BackgroundScheduler | None = None
 shutdown_event = threading.Event()
 
@@ -382,6 +384,14 @@ def _persist_trade(trade: dict) -> None:
         charges=trade["charges"],
     )
 
+    # Feed trade to adaptive engine for evolution analysis
+    if adaptive:
+        regime = "UNKNOWN"
+        if strategy_engine:
+            sig_info = strategy_engine.last_signals.get(trade["instrument"], {})
+            regime = sig_info.get("regime", "UNKNOWN")
+        adaptive.record_trade(trade, regime=regime)
+
 
 # ── Periodic tasks ───────────────────────────────────────────────────
 def _heartbeat() -> None:
@@ -503,6 +513,21 @@ def _daily_summary() -> None:
     )
     log.info("Daily summary: %s", s)
 
+    # Run end-of-day evolution cycle
+    if adaptive:
+        try:
+            historical = adaptive.fetch_recent_trades()
+            result = adaptive.evolve(db_trades=historical)
+            if result.get("evolved"):
+                log.info("Evolution result: %s", result)
+                # Apply evolved weights for next trading day
+                if strategy_engine:
+                    adaptive.apply_to_engine(strategy_engine)
+                adaptive.apply_param_overrides()
+            adaptive.flush_daily_buffer()
+        except Exception:
+            log.exception("Evolution cycle failed — continuing with current params.")
+
 
 # ── Shutdown ─────────────────────────────────────────────────────────
 def _graceful_shutdown(signum=None, frame=None) -> None:
@@ -527,7 +552,7 @@ def _graceful_shutdown(signum=None, frame=None) -> None:
 # ── Main ─────────────────────────────────────────────────────────────
 def main() -> None:
     global kite, order_mgr, risk_mgr, pos_tracker, data_feed
-    global strategy_engine, scheduler
+    global strategy_engine, adaptive, scheduler
 
     # 0. Market day check
     if not is_market_day():
@@ -568,6 +593,15 @@ def main() -> None:
         ],
         min_agreement=2,
     )
+
+    # 4b. Initialize adaptive engine — loads evolved weights/params from disk
+    adaptive = AdaptiveEngine()
+    adaptive.load_state()
+    adaptive.apply_to_engine(strategy_engine)
+    adaptive.apply_param_overrides()
+    # Give strategy engine access to regime memory for live weight boosts
+    strategy_engine._adaptive_engine = adaptive
+    log.info("Adaptive engine: %s", adaptive.status)
 
     # 5. Load previous-day close prices for gap detection
     log.info("Loading previous-day close prices for gap filter...")
