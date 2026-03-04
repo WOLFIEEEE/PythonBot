@@ -153,6 +153,14 @@ class PositionTracker:
                 total += pos.current_pnl
             self.total_unrealized_pnl = total
 
+    # ── Revert trailing SL (if exchange modify fails) ────────────────
+    def revert_trailing_sl(self, symbol: str, old_sl: float) -> None:
+        """Revert trailing_sl to old value when exchange SL modify fails."""
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if pos is not None:
+                pos.trailing_sl = old_sl
+
     # ── Trailing stop-loss update ────────────────────────────────────
     def update_trailing_sl(self, symbol: str, ltp: float) -> float | None:
         """

@@ -44,8 +44,58 @@ def is_past_no_new_trades_time() -> bool:
 
 
 def is_market_day() -> bool:
-    """Monday=0 … Friday=4 are trading days (holidays not checked)."""
-    return now_ist().weekday() < 5
+    """
+    Check if today is a trading day.
+    Filters weekends AND known NSE holidays for 2025-2026.
+    """
+    today = now_ist()
+    if today.weekday() >= 5:
+        return False
+    return today.date() not in NSE_HOLIDAYS
+
+
+# ── NSE Holidays (2025-2026) ─────────────────────────────────────────
+# Source: NSE circulars. Update annually.
+from datetime import date as _date
+
+NSE_HOLIDAYS: set = {
+    # 2025
+    _date(2025, 2, 26),   # Mahashivratri
+    _date(2025, 3, 14),   # Holi
+    _date(2025, 3, 31),   # Id-Ul-Fitr (Ramadan)
+    _date(2025, 4, 10),   # Shri Mahavir Jayanti
+    _date(2025, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    _date(2025, 4, 18),   # Good Friday
+    _date(2025, 5, 1),    # Maharashtra Day
+    _date(2025, 6, 7),    # Bakri Id (Eid ul-Adha)
+    _date(2025, 8, 15),   # Independence Day
+    _date(2025, 8, 16),   # Janmashtami
+    _date(2025, 10, 2),   # Mahatma Gandhi Jayanti
+    _date(2025, 10, 21),  # Dussehra
+    _date(2025, 10, 22),  # Dussehra (Vijaya Dashami)
+    _date(2025, 11, 5),   # Diwali (Laxmi Puja)
+    _date(2025, 11, 6),   # Diwali (Balipratipada)
+    _date(2025, 11, 26),  # Guru Nanak Jayanti
+    _date(2025, 12, 25),  # Christmas
+    # 2026
+    _date(2026, 1, 26),   # Republic Day
+    _date(2026, 2, 17),   # Mahashivratri
+    _date(2026, 3, 3),    # Holi
+    _date(2026, 3, 20),   # Id-Ul-Fitr (Ramadan)
+    _date(2026, 3, 30),   # Shri Ram Navami
+    _date(2026, 4, 3),    # Good Friday
+    _date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    _date(2026, 5, 1),    # Maharashtra Day
+    _date(2026, 5, 25),   # Buddha Purnima
+    _date(2026, 5, 28),   # Bakri Id (Eid ul-Adha)
+    _date(2026, 8, 14),   # Janmashtami
+    _date(2026, 8, 15),   # Independence Day
+    _date(2026, 10, 2),   # Mahatma Gandhi Jayanti
+    _date(2026, 10, 12),  # Dussehra
+    _date(2026, 10, 23),  # Diwali (Laxmi Puja)
+    _date(2026, 11, 16),  # Guru Nanak Jayanti
+    _date(2026, 12, 25),  # Christmas
+}
 
 
 # ── Instrument lookup ────────────────────────────────────────────────

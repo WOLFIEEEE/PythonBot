@@ -25,6 +25,10 @@ log = get_logger(__name__)
 # If no tick received for an instrument in this many seconds, consider data stale
 STALE_THRESHOLD_SECONDS = 120
 
+# Maximum allowed price change (%) from last known price in a single tick.
+# NSE circuit limits are 5/10/20%, so 25% catches anything beyond circuit limits.
+TICK_PRICE_BAND_PCT = 25.0
+
 
 class CandleAggregator:
     """Aggregates ticks into fixed-interval OHLCV candles."""
@@ -41,6 +45,12 @@ class CandleAggregator:
         self._current: dict[str, dict[str, Any]] = {}
         self._candles: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._last_tick_time: dict[str, datetime] = {}
+        # Track previous cumulative volume per instrument for per-candle delta
+        self._prev_cum_volume: dict[str, int] = {}
+        # Track cumulative volume at candle start for delta calculation
+        self._candle_start_volume: dict[str, int] = {}
+        # Last known valid price per instrument (for price band filtering)
+        self._last_valid_price: dict[str, float] = {}
 
     def _floor_time(self, dt: datetime) -> datetime:
         """Floor datetime to the candle interval boundary."""
@@ -58,12 +68,27 @@ class CandleAggregator:
         """
         Process a tick. Returns the finalized candle dict if a candle just
         closed, else None.
+
+        Volume is computed as per-candle delta (not cumulative exchange volume)
+        to ensure strategy volume comparisons are meaningful.
         """
         ltp = tick.get("last_price")
         if ltp is None or ltp <= 0:
             return None  # Invalid tick — skip
 
-        volume = tick.get("volume_traded", 0)
+        # Price band filter: reject ticks that deviate too far from last price
+        last_price = self._last_valid_price.get(symbol)
+        if last_price is not None and last_price > 0:
+            change_pct = abs(ltp - last_price) / last_price * 100
+            if change_pct > TICK_PRICE_BAND_PCT:
+                log.warning(
+                    "Tick rejected for %s: price %.2f deviates %.1f%% from last %.2f",
+                    symbol, ltp, change_pct, last_price,
+                )
+                return None
+        self._last_valid_price[symbol] = ltp
+
+        cum_volume = tick.get("volume_traded", 0)
         ts = tick.get("exchange_timestamp") or datetime.now()
 
         # Validate timestamp is not far in the future
@@ -84,21 +109,26 @@ class CandleAggregator:
                 if len(self._candles[symbol]) > self.max_candles:
                     self._candles[symbol] = self._candles[symbol][-self.max_candles:]
 
+            # Record cumulative volume at candle start for delta calculation
+            self._candle_start_volume[symbol] = self._prev_cum_volume.get(symbol, cum_volume)
+
             self._current[symbol] = {
                 "timestamp": candle_start,
                 "open": ltp,
                 "high": ltp,
                 "low": ltp,
                 "close": ltp,
-                "volume": volume,
+                "volume": max(0, cum_volume - self._candle_start_volume.get(symbol, cum_volume)),
             }
+            self._prev_cum_volume[symbol] = cum_volume
             return finalized
 
-        # Same candle — update
+        # Same candle — update OHLC and per-candle volume delta
         cur["high"] = max(cur["high"], ltp)
         cur["low"] = min(cur["low"], ltp)
         cur["close"] = ltp
-        cur["volume"] = volume  # cumulative from exchange
+        cur["volume"] = max(0, cum_volume - self._candle_start_volume.get(symbol, cum_volume))
+        self._prev_cum_volume[symbol] = cum_volume
         return None
 
     def get_dataframe(self, symbol: str) -> pd.DataFrame:

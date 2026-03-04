@@ -155,6 +155,10 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
     # Place target order (non-critical — position is still protected by SL)
     tgt_oid = order_mgr.place_target_order(symbol, exit_dir, qty, target_price)
 
+    # Determine winning strategy from confluence engine
+    sig_info = strategy_engine.last_signals.get(symbol, {})
+    winning_strategy = sig_info.get("strategy", "Confluence")
+
     # Track the position
     pos_tracker.open_position(
         symbol=symbol,
@@ -163,7 +167,7 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         quantity=qty,
         sl_price=sl_price,
         target_price=target_price,
-        strategy=strategy_engine.strategy_classes[0].name,
+        strategy=winning_strategy,
         entry_order_id=entry_oid,
         sl_order_id=sl_oid,
         target_order_id=tgt_oid,
@@ -172,7 +176,7 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
     risk_amount = abs(fill_price - sl_price) * qty
     notify_trade_entry(
         symbol, signal_val, fill_price, qty, sl_price, target_price,
-        strategy_engine.strategy_classes[0].name, risk_amount,
+        winning_strategy, risk_amount,
     )
 
 
@@ -210,13 +214,21 @@ def _manage_open_positions(symbol: str) -> None:
                 _persist_trade(trade)
             return
 
-    # Trailing SL
+    # Trailing SL — atomic: revert tracker if exchange modify fails
     if settings.TRAILING_SL and data_feed:
         ltp = data_feed.get_ltp(symbol)
         if ltp:
+            old_sl = pos.trailing_sl
             new_sl = pos_tracker.update_trailing_sl(symbol, ltp)
             if new_sl and pos.sl_order_id:
-                order_mgr.modify_sl_order(pos.sl_order_id, new_sl)
+                success = order_mgr.modify_sl_order(pos.sl_order_id, new_sl)
+                if not success:
+                    # Revert: exchange still has the old trigger
+                    pos_tracker.revert_trailing_sl(symbol, old_sl)
+                    log.warning(
+                        "Trailing SL modify failed for %s — reverted to %.2f",
+                        symbol, old_sl,
+                    )
 
 
 def _log_and_notify_exit(trade: dict) -> None:

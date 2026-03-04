@@ -28,10 +28,17 @@ class EMACrossoverStrategy(BaseStrategy):
         df["ema_fast"] = df["close"].ewm(span=settings.EMA_FAST, adjust=False).mean()
         df["ema_slow"] = df["close"].ewm(span=settings.EMA_SLOW, adjust=False).mean()
 
-        # VWAP (intraday cumulative)
+        # VWAP (intraday cumulative, reset at market open 9:15)
         typical = (df["high"] + df["low"] + df["close"]) / 3
-        cum_tp_vol = (typical * df["volume"]).cumsum()
-        cum_vol = df["volume"].cumsum().replace(0, np.nan)
+        tp_vol = typical * df["volume"]
+        # Group by date to reset VWAP daily
+        if hasattr(df.index, "date"):
+            groups = df.index.date
+            cum_tp_vol = tp_vol.groupby(groups).cumsum()
+            cum_vol = df["volume"].groupby(groups).cumsum().replace(0, np.nan)
+        else:
+            cum_tp_vol = tp_vol.cumsum()
+            cum_vol = df["volume"].cumsum().replace(0, np.nan)
         df["vwap"] = cum_tp_vol / cum_vol
 
         # RSI(14)
