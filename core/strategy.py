@@ -1,16 +1,44 @@
 """
-Base strategy interface and multi-strategy confluence engine.
+Base strategy interface and advanced multi-strategy confluence engine.
+
+Key improvements over simple voting:
+  - Signal strength scoring (0.0 - 1.0) instead of binary BUY/SELL
+  - Market regime detection (TRENDING / RANGING / VOLATILE)
+  - Adaptive confluence thresholds based on regime
+  - Detailed signal tracking for dashboard display
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Signal model
+# ═══════════════════════════════════════════════════════════════════════
+class SignalType(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD = "HOLD"
+
+
+@dataclass
+class Signal:
+    direction: str = "HOLD"        # BUY / SELL / HOLD
+    strength: float = 0.0          # 0.0 (no signal) → 1.0 (strongest)
+    strategy_name: str = ""
+    reason: str = ""
 
 
 class BaseStrategy(ABC):
@@ -30,6 +58,19 @@ class BaseStrategy(ABC):
     def generate_signal(self) -> str:
         """Return 'BUY', 'SELL', or 'HOLD'."""
 
+    def compute_signal_strength(self) -> Signal:
+        """
+        Enhanced: compute indicators, generate direction AND strength.
+        Subclasses can override for custom strength scoring.
+        Default: binary strength (1.0 if signal, 0.0 if hold).
+        """
+        if self.df.empty or len(self.df) < 2:
+            return Signal("HOLD", 0.0, self.name)
+        self.compute_indicators()
+        direction = self.generate_signal()
+        strength = 1.0 if direction != "HOLD" else 0.0
+        return Signal(direction, strength, self.name)
+
     def evaluate(self) -> str:
         """Compute indicators then return a signal."""
         if self.df.empty or len(self.df) < 2:
@@ -38,10 +79,72 @@ class BaseStrategy(ABC):
         return self.generate_signal()
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Market Regime Detector
+# ═══════════════════════════════════════════════════════════════════════
+class MarketRegime(str, Enum):
+    TRENDING = "TRENDING"
+    RANGING = "RANGING"
+    VOLATILE = "VOLATILE"
+
+
+def detect_regime(df: pd.DataFrame, lookback: int = 20) -> MarketRegime:
+    """
+    Classify the current market regime using ADX and ATR ratio.
+
+    TRENDING:  ADX > 25 → strong directional movement, good for trend strategies
+    VOLATILE:  ATR/close > 1.5x 50-period avg → choppy, widen SL or sit out
+    RANGING:   ADX < 20 and low ATR → mean-reverting, ORB/VWAP work better
+    """
+    if len(df) < 50:
+        return MarketRegime.RANGING
+
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+
+    # ── ADX calculation ──
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr14 = tr.rolling(14).mean()
+    plus_di = 100 * (plus_dm.rolling(14).mean() / atr14.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.rolling(14).mean() / atr14.replace(0, np.nan))
+
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
+    adx = dx.rolling(14).mean()
+
+    current_adx = adx.iloc[-1]
+    current_atr = atr14.iloc[-1]
+    avg_atr = atr14.iloc[-50:].mean()
+    atr_ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
+
+    if pd.isna(current_adx):
+        return MarketRegime.RANGING
+
+    if atr_ratio > 1.5:
+        return MarketRegime.VOLATILE
+    if current_adx > 25:
+        return MarketRegime.TRENDING
+    return MarketRegime.RANGING
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Enhanced Strategy Engine
+# ═══════════════════════════════════════════════════════════════════════
 class StrategyEngine:
     """
-    Multi-strategy confluence: run several strategies and trade only when
-    a majority agree.
+    Multi-strategy confluence with:
+      - Weighted signal strength scoring
+      - Market regime-adaptive thresholds
+      - Detailed signal tracking for dashboard
     """
 
     def __init__(
@@ -52,22 +155,108 @@ class StrategyEngine:
         self.strategy_classes = strategy_classes
         self.min_agreement = min_agreement
 
+        # Track last signals per instrument for dashboard
+        self.last_signals: dict[str, dict[str, Any]] = {}
+
+        # Strategy weights (can be customised)
+        self._weights: dict[str, float] = {}
+
     def evaluate(self, instrument: str, df: pd.DataFrame) -> str:
         """
-        Evaluate all strategies. Return 'BUY' or 'SELL' if at least
-        `min_agreement` strategies agree, else 'HOLD'.
+        Evaluate all strategies and return the consensus signal.
+
+        Algorithm:
+          1. Detect market regime
+          2. Run all strategies → collect Signal objects
+          3. Compute weighted score for BUY and SELL
+          4. Apply regime-adaptive threshold
+          5. Require min_agreement strategies to agree
+          6. Return final signal
         """
-        votes: dict[str, int] = {"BUY": 0, "SELL": 0, "HOLD": 0}
+        if df.empty or len(df) < 10:
+            return "HOLD"
+
+        # 1. Market regime
+        regime = detect_regime(df)
+
+        # 2. Run strategies
+        signals: list[Signal] = []
         for cls in self.strategy_classes:
-            strat = cls(instrument, df.copy())
-            signal = strat.evaluate()
-            votes[signal] += 1
-            log.debug(
-                "%s | %s → %s", instrument, cls.name, signal,
+            try:
+                strat = cls(instrument, df.copy())
+                sig = strat.compute_signal_strength()
+                signals.append(sig)
+                log.debug("%s | %s → %s (%.2f)", instrument, cls.name, sig.direction, sig.strength)
+            except Exception:
+                log.exception("Strategy %s failed for %s", cls.name, instrument)
+                signals.append(Signal("HOLD", 0.0, cls.name))
+
+        # 3. Aggregate
+        buy_signals = [s for s in signals if s.direction == "BUY"]
+        sell_signals = [s for s in signals if s.direction == "SELL"]
+
+        buy_count = len(buy_signals)
+        sell_count = len(sell_signals)
+        buy_score = sum(s.strength * self._weights.get(s.strategy_name, 1.0) for s in buy_signals)
+        sell_score = sum(s.strength * self._weights.get(s.strategy_name, 1.0) for s in sell_signals)
+
+        # 4. Regime-adaptive threshold
+        threshold = self._regime_threshold(regime)
+        effective_agreement = max(1, self.min_agreement)
+
+        # In volatile regimes, require stronger consensus
+        if regime == MarketRegime.VOLATILE:
+            effective_agreement = min(len(self.strategy_classes), self.min_agreement + 1)
+
+        # 5. Final decision
+        final = "HOLD"
+        winning_strategy = ""
+
+        if buy_count >= effective_agreement and buy_score >= threshold:
+            final = "BUY"
+            winning_strategy = buy_signals[0].strategy_name if buy_signals else ""
+        elif sell_count >= effective_agreement and sell_score >= threshold:
+            final = "SELL"
+            winning_strategy = sell_signals[0].strategy_name if sell_signals else ""
+
+        # 6. Track for dashboard
+        self.last_signals[instrument] = {
+            "signal": final,
+            "regime": regime.value,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "buy_score": round(buy_score, 2),
+            "sell_score": round(sell_score, 2),
+            "threshold": round(threshold, 2),
+            "effective_agreement": effective_agreement,
+            "strategy": winning_strategy,
+            "details": [
+                {"name": s.strategy_name, "direction": s.direction, "strength": round(s.strength, 2)}
+                for s in signals
+            ],
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        if final != "HOLD":
+            log.info(
+                "%s | SIGNAL: %s | regime=%s | buy=%d(%.1f) sell=%d(%.1f) threshold=%.1f",
+                instrument, final, regime.value,
+                buy_count, buy_score, sell_count, sell_score, threshold,
             )
 
-        if votes["BUY"] >= self.min_agreement:
-            return "BUY"
-        if votes["SELL"] >= self.min_agreement:
-            return "SELL"
-        return "HOLD"
+        return final
+
+    @staticmethod
+    def _regime_threshold(regime: MarketRegime) -> float:
+        """
+        Minimum weighted score needed to act on a signal.
+
+        TRENDING: Lower bar — trends are your friend.
+        RANGING:  Medium bar — false breakouts more likely.
+        VOLATILE: Higher bar — noise is high, need strong consensus.
+        """
+        return {
+            MarketRegime.TRENDING: 1.5,
+            MarketRegime.RANGING: 1.8,
+            MarketRegime.VOLATILE: 2.5,
+        }[regime]

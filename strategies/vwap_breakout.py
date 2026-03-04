@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.strategy import BaseStrategy
+from core.strategy import BaseStrategy, Signal
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -63,3 +63,40 @@ class VWAPBreakoutStrategy(BaseStrategy):
         if below and rsi < 50:
             return "SELL"
         return "HOLD"
+
+    def compute_signal_strength(self) -> Signal:
+        """Score based on VWAP distance and RSI strength."""
+        if self.df.empty or len(self.df) < MIN_CANDLES:
+            return Signal("HOLD", 0.0, self.name)
+
+        self.compute_indicators()
+        direction = self.generate_signal()
+        if direction == "HOLD":
+            return Signal("HOLD", 0.0, self.name)
+
+        curr = self.df.iloc[-1]
+        last3 = self.df.iloc[-3:]
+        score = 0.4  # Base: 3-candle sustained breakout
+
+        # Distance from VWAP — further = stronger conviction
+        vwap = curr.get("vwap", 0)
+        if vwap > 0:
+            pct_dist = abs(curr["close"] - vwap) / vwap * 100
+            score += min(pct_dist * 0.15, 0.3)
+
+        # RSI strength
+        rsi = curr.get("rsi", 50)
+        if direction == "BUY" and rsi > 55:
+            score += min((rsi - 50) / 30, 0.2)
+        elif direction == "SELL" and rsi < 45:
+            score += min((50 - rsi) / 30, 0.2)
+
+        # Consistency of close vs VWAP across candles
+        if direction == "BUY":
+            margin = (last3["close"] - last3["vwap"]).mean()
+        else:
+            margin = (last3["vwap"] - last3["close"]).mean()
+        if vwap > 0 and margin > 0:
+            score += min(margin / vwap * 100 * 0.1, 0.1)
+
+        return Signal(direction, min(score, 1.0), self.name)

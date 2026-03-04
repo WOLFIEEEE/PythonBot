@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
-from core.strategy import BaseStrategy
+from core.strategy import BaseStrategy, Signal
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -74,3 +74,40 @@ class EMACrossoverStrategy(BaseStrategy):
         if cross_down and below_vwap and 30 <= rsi <= 60:
             return "SELL"
         return "HOLD"
+
+    def compute_signal_strength(self) -> Signal:
+        """Score 0-1 based on how many confirmations are present."""
+        if self.df.empty or len(self.df) < MIN_CANDLES:
+            return Signal("HOLD", 0.0, self.name)
+
+        self.compute_indicators()
+        direction = self.generate_signal()
+        if direction == "HOLD":
+            return Signal("HOLD", 0.0, self.name)
+
+        curr = self.df.iloc[-1]
+        score = 0.0
+
+        # Crossover confirmed = 0.3
+        score += 0.3
+
+        # VWAP alignment = 0.25
+        if direction == "BUY" and curr["close"] > curr.get("vwap", 0):
+            score += 0.25
+        elif direction == "SELL" and curr["close"] < curr.get("vwap", float("inf")):
+            score += 0.25
+
+        # Volume confirmation = 0.25
+        vol_avg = curr.get("vol_avg", 0)
+        if vol_avg > 0 and curr["volume"] > 1.5 * vol_avg:
+            vol_ratio = min(curr["volume"] / vol_avg / 3.0, 1.0)
+            score += 0.25 * vol_ratio
+
+        # RSI in sweet spot = 0.2
+        rsi = curr.get("rsi", 50)
+        if direction == "BUY" and 45 <= rsi <= 65:
+            score += 0.2
+        elif direction == "SELL" and 35 <= rsi <= 55:
+            score += 0.2
+
+        return Signal(direction, min(score, 1.0), self.name)

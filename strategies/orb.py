@@ -14,7 +14,7 @@ from datetime import time as dt_time
 import pandas as pd
 
 from config import settings
-from core.strategy import BaseStrategy
+from core.strategy import BaseStrategy, Signal
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -96,6 +96,35 @@ class ORBStrategy(BaseStrategy):
             return "SELL"
 
         return "HOLD"
+
+    def compute_signal_strength(self) -> Signal:
+        """Score based on breakout distance and volume strength."""
+        if self.df.empty or len(self.df) < 3:
+            return Signal("HOLD", 0.0, self.name)
+
+        self.compute_indicators()
+        direction = self.generate_signal()
+        if direction == "HOLD":
+            return Signal("HOLD", 0.0, self.name)
+
+        curr = self.df.iloc[-1]
+        score = 0.4  # Base: clean breakout through ORB level
+
+        # Distance past the ORB boundary — further = stronger
+        if direction == "BUY" and self._orb_high:
+            overshoot = (curr["close"] - self._orb_high) / self._orb_high * 100
+            score += min(overshoot * 0.2, 0.3)
+        elif direction == "SELL" and self._orb_low:
+            overshoot = (self._orb_low - curr["close"]) / self._orb_low * 100
+            score += min(overshoot * 0.2, 0.3)
+
+        # Volume strength
+        vol_avg = curr.get("vol_avg", 0)
+        if vol_avg > 0:
+            vol_ratio = curr["volume"] / vol_avg
+            score += min((vol_ratio - 1.0) * 0.15, 0.3)
+
+        return Signal(direction, min(score, 1.0), self.name)
 
     @property
     def orb_high(self) -> float | None:

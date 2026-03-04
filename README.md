@@ -7,6 +7,7 @@ A production-grade, fully automated Python intraday trading bot for the Indian s
 ## Table of Contents
 
 - [Features](#features)
+- [GUI Launcher (Recommended)](#gui-launcher-recommended)
 - [Architecture Overview](#architecture-overview)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
@@ -70,6 +71,88 @@ A production-grade, fully automated Python intraday trading bot for the Indian s
 | **Charges Estimation** | Brokerage, STT, GST, SEBI charges, stamp duty — accurate net P&L |
 | **Graceful Shutdown** | SIGINT/SIGTERM handlers square off positions before exiting |
 | **Resilience** | Retry with exponential backoff on all API calls, WebSocket auto-reconnect, session heartbeat |
+| **GUI Launcher** | Dark-themed setup wizard + live dashboard with P&L cards, positions, trade log, bot logs |
+| **Signal Strength Scoring** | Each strategy outputs a 0-1 confidence score, not just BUY/SELL |
+| **Market Regime Detection** | ADX-based regime (Trending/Ranging/Volatile) adapts confluence thresholds |
+| **Auto OAuth** | Local HTTP server captures the Kite login redirect — no manual token pasting |
+
+---
+
+## GUI Launcher (Recommended)
+
+The easiest way to run the bot is through the GUI launcher. No manual config file editing needed.
+
+### Launch the GUI
+
+```bash
+python -m gui.launcher
+```
+
+### Setup Wizard
+
+The GUI walks you through 6 configuration steps:
+
+| Step | What You Configure |
+|---|---|
+| **1. API Credentials** | Kite Connect API Key and Secret |
+| **2. Capital & Risk** | Total capital, risk %, max trades, SL/target %, trailing SL |
+| **3. Market Timing** | Square-off time, no-new-trades cutoff, candle interval |
+| **4. Strategy Selection** | Choose which strategies to enable + min confluence |
+| **5. Watchlist** | Add/remove instruments (NSE:SYMBOL format) |
+| **6. Telegram** | Bot token + chat ID for notifications (optional) |
+
+After configuring, click **Start Trading** to launch.
+
+### Live Dashboard
+
+Once running, the dashboard shows:
+
+- **Status bar** — RUNNING/STOPPED + IST clock
+- **P&L Cards** — Realized, Unrealized, Total P&L, Trades, Open Positions, Win Rate
+- **Open Positions tab** — Real-time table of all positions with entry, SL, target, P&L
+- **Trade Log tab** — All closed trades with exit reason and strategy
+- **Bot Log tab** — Live scrolling log with colour-coded entries (green=trades, red=errors, orange=warnings)
+- **Controls** — Stop Bot, Emergency Square-Off, Back to Setup
+
+### How It Works
+
+```
+GUI Setup Wizard
+    |
+    v
+Writes config/.env + config/settings_override.json
+    |
+    v
+Launches bot_runner.py in a background thread
+    |
+    v
+bot_runner.py:
+  1. Applies GUI parameters to config.settings at runtime
+  2. Authenticates (auto-redirect or manual fallback)
+  3. Starts WebSocket, StrategyEngine, Scheduler
+  4. Runs event-driven trading loop
+    |
+    v
+Dashboard reads bot state every 1 second:
+  - P&L from PositionTracker
+  - Positions from PositionTracker
+  - Trades from closed_trades list
+  - Logs from QueueLogHandler -> log_queue
+```
+
+Your settings are saved to `gui/last_config.json` and auto-loaded next time you open the GUI (except the API secret, which must be re-entered).
+
+---
+
+### CLI Mode (Advanced)
+
+You can still run the bot without the GUI:
+
+```bash
+python main.py
+```
+
+This uses `config/.env` and `config/settings.py` directly.
 
 ---
 
@@ -142,6 +225,11 @@ kite-intraday-bot/
 │   ├── __init__.py
 │   ├── backtester.py         # Historical replay engine with performance metrics
 │   └── data_downloader.py    # Fetch OHLCV candles from Kite historical API
+│
+├── gui/
+│   ├── __init__.py
+│   ├── launcher.py           # Tkinter GUI — setup wizard + live dashboard
+│   └── bot_runner.py         # Bridge between GUI and trading engine
 │
 ├── utils/
 │   ├── __init__.py
@@ -224,6 +312,20 @@ Edit `config/.env` with your actual credentials (see next section).
 
 ```bash
 mkdir -p logs
+```
+
+### Step 6: Launch
+
+**Option A — GUI (Recommended):**
+```bash
+python -m gui.launcher
+```
+
+**Option B — CLI:**
+```bash
+cp config/.env.example config/.env
+# Edit config/.env with your API credentials
+python main.py
 ```
 
 ---
