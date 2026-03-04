@@ -50,6 +50,21 @@ app.config["SECRET_KEY"] = os.environ.get(
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
+# Session cookie settings
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["PERMANENT_SESSION_LIFETIME"] = 86400  # 24 hours
+
+
+# ── Health check endpoint (no auth — used by Docker HEALTHCHECK) ──────
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "healthy",
+        "bot_running": _bot_refs.get("bot_running", False),
+        "timestamp": datetime.now().isoformat(),
+    }), 200
+
+
 # ── Password configuration ────────────────────────────────────────────
 # Password is stored as SHA-256 hash. Set via env var or config.
 # Default: "admin123" — MUST be changed in production.
@@ -144,6 +159,24 @@ def api_signals():
     if not engine:
         return jsonify({})
     return jsonify(engine.last_signals)
+
+
+@app.route("/api/warmup")
+@login_required
+def api_warmup():
+    """Show candle warmup status per instrument."""
+    data_feed = _bot_refs.get("data_feed")
+    if not data_feed:
+        return jsonify({})
+    status = {}
+    for sym in (data_feed.aggregator._candles.keys()):
+        count = data_feed.aggregator.get_candle_count(sym)
+        status[sym] = {
+            "candle_count": count,
+            "ready": count >= 25,
+            "has_prev_close": sym in data_feed.aggregator._prev_day_close,
+        }
+    return jsonify(status)
 
 
 @app.route("/api/adaptive")

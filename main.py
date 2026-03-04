@@ -611,11 +611,12 @@ def main() -> None:
     global kite, order_mgr, risk_mgr, pos_tracker, data_feed
     global strategy_engine, adaptive, scheduler
 
-    # 0. Market day check
-    if not is_market_day():
-        log.info("Today is not a trading day (weekend). Exiting.")
-        print("Today is not a trading day (weekend). Exiting.")
-        return
+    # 0. Market day check (skip with SKIP_MARKET_DAY_CHECK=true for testing)
+    if os.environ.get("SKIP_MARKET_DAY_CHECK", "").lower() not in ("true", "1", "yes"):
+        if not is_market_day():
+            log.info("Today is not a trading day (weekend/holiday). Exiting.")
+            print("Today is not a trading day. Set SKIP_MARKET_DAY_CHECK=true to override.")
+            return
 
     # 1. Init database
     db.init_db()
@@ -675,21 +676,7 @@ def main() -> None:
     )
     log.info("Web dashboard started on port %d", dashboard_port)
 
-    # 5. Load previous-day close prices for gap detection
-    log.info("Loading previous-day close prices for gap filter...")
-    try:
-        ohlc_data = kite.ohlc([f"{settings.EXCHANGE}:{sym}" for sym in token_map])
-        for key, val in ohlc_data.items():
-            sym = key.split(":")[-1]
-            prev_close = val.get("ohlc", {}).get("close", 0)
-            if prev_close > 0:
-                # Will be set on the aggregator after DataFeed init
-                pass
-    except Exception as exc:
-        log.warning("Failed to load prev-day closes for gap filter: %s", exc)
-        ohlc_data = {}
-
-    # 6. Start WebSocket data feed
+    # 5. Create WebSocket data feed
     data_feed = DataFeed(
         access_token=kite.access_token,
         token_symbol_map=inv_map,
@@ -697,13 +684,34 @@ def main() -> None:
         candle_interval=settings.CANDLE_INTERVAL_MINUTES,
     )
 
-    # Set previous-day close on aggregator for gap detection
-    for key, val in ohlc_data.items():
-        sym = key.split(":")[-1]
-        prev_close = val.get("ohlc", {}).get("close", 0)
-        if prev_close > 0:
-            data_feed.aggregator.set_prev_day_close(sym, prev_close)
+    # 5a. Pre-load historical candles so strategies have warmup data immediately.
+    # Without this, EMA needs 25 candles (125 min) before first signal — missing
+    # the entire 9:15-11:30 opening window. Historical API: 3 req/sec.
+    from core.candle_preloader import preload_candles
+    try:
+        preload_result = preload_candles(kite, data_feed, token_map)
+        log.info(
+            "Candle warmup: %d instruments preloaded, %d total candles.",
+            len(preload_result), sum(preload_result.values()),
+        )
+    except Exception as exc:
+        log.warning("Candle preload failed (will rely on live data): %s", exc)
 
+    # 5b. Load previous-day close for gap detection via kite.ohlc().
+    # Supplements prev_day_close already set by preloader, and provides
+    # today's OHLC snapshot for gap check at market open.
+    log.info("Loading previous-day close prices for gap filter...")
+    try:
+        ohlc_data = kite.ohlc([f"{settings.EXCHANGE}:{sym}" for sym in token_map])
+        for key, val in ohlc_data.items():
+            sym = key.split(":")[-1]
+            prev_close = val.get("ohlc", {}).get("close", 0)
+            if prev_close > 0:
+                data_feed.aggregator.set_prev_day_close(sym, prev_close)
+    except Exception as exc:
+        log.warning("Failed to load prev-day closes: %s (will extract from live ticks)", exc)
+
+    # 5c. Start WebSocket for live ticks (historical candles already in aggregator)
     data_feed.start()
 
     # Update dashboard reference now that data_feed is ready

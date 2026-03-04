@@ -8,17 +8,16 @@ echo "=============================================="
 # ── 1. Verify required environment variables ──────────────────────────
 if [ -z "$KITE_API_KEY" ] || [ -z "$KITE_API_SECRET" ]; then
     echo ""
-    echo "ERROR: KITE_API_KEY and KITE_API_SECRET must be set."
+    echo "WARNING: KITE_API_KEY and KITE_API_SECRET are not set."
     echo ""
-    echo "Create a config/.env file with:"
+    echo "The dashboard will start, but the bot cannot trade."
+    echo "Set these via Coolify environment variables or config/.env file:"
     echo "  KITE_API_KEY=your_api_key"
     echo "  KITE_API_SECRET=your_api_secret"
     echo ""
-    echo "Or pass them via docker-compose environment variables."
-    exit 1
+else
+    echo "[OK] Kite API credentials found."
 fi
-
-echo "[OK] Kite API credentials found."
 
 # ── 2. Ensure data directories exist ─────────────────────────────────
 mkdir -p /app/data /app/logs
@@ -49,9 +48,25 @@ telegram = 'Configured' if settings.TELEGRAM_BOT_TOKEN else 'Not configured'
 print(f'[OK] Telegram alerts: {telegram}')
 "
 
+# ── 6. Dashboard info ─────────────────────────────────────────────────
+DASH_PORT="${DASHBOARD_PORT:-5000}"
 echo ""
-echo "Starting trading bot..."
+echo "----------------------------------------------"
+echo " Dashboard: http://0.0.0.0:${DASH_PORT}"
+echo " Password:  Set DASHBOARD_PASSWORD_HASH env var"
+echo "            Default password: admin123"
+echo "----------------------------------------------"
+
+if [ -n "$DASHBOARD_PASSWORD_HASH" ]; then
+    echo "[OK] Custom dashboard password hash configured."
+else
+    echo "[!!] Using DEFAULT dashboard password (admin123)."
+    echo "     Set DASHBOARD_PASSWORD_HASH for production!"
+fi
+
+echo ""
+echo "Starting trading bot + dashboard..."
 echo "=============================================="
 
-# ── 6. Run the command (default: python main.py) ─────────────────────
+# ── 7. Run the command (default: python main.py) ─────────────────────
 exec "$@"

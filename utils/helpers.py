@@ -99,12 +99,55 @@ NSE_HOLIDAYS: set = {
 
 
 # ── Instrument lookup ────────────────────────────────────────────────
+
+# Module-level cache for full instrument metadata
+_instrument_metadata: dict[str, dict] = {}
+
+
 def build_instrument_map(kite) -> dict[str, int]:
     """
     Fetch all NSE instruments and return {tradingsymbol: instrument_token}.
+
+    Also caches full instrument metadata (lot_size, tick_size, exchange_token,
+    instrument_type, etc.) in _instrument_metadata for later use.
     """
+    global _instrument_metadata
     instruments = kite.instruments("NSE")
-    return {row["tradingsymbol"]: row["instrument_token"] for row in instruments}
+
+    token_map = {}
+    for row in instruments:
+        sym = row["tradingsymbol"]
+        token_map[sym] = row["instrument_token"]
+        _instrument_metadata[sym] = {
+            "instrument_token": row["instrument_token"],
+            "exchange_token": row.get("exchange_token", ""),
+            "tradingsymbol": sym,
+            "name": row.get("name", ""),
+            "lot_size": row.get("lot_size", 1),
+            "tick_size": row.get("tick_size", 0.05),
+            "instrument_type": row.get("instrument_type", "EQ"),
+            "segment": row.get("segment", "NSE"),
+            "exchange": row.get("exchange", "NSE"),
+        }
+    log.info("Cached metadata for %d NSE instruments.", len(_instrument_metadata))
+    return token_map
+
+
+def get_instrument_metadata(symbol: str) -> dict | None:
+    """Return cached metadata for a symbol, or None if not found."""
+    return _instrument_metadata.get(symbol)
+
+
+def get_tick_size(symbol: str) -> float:
+    """Return the tick size for a symbol (default 0.05)."""
+    meta = _instrument_metadata.get(symbol)
+    return meta["tick_size"] if meta else 0.05
+
+
+def get_lot_size(symbol: str) -> int:
+    """Return the lot size for a symbol (default 1 for equities)."""
+    meta = _instrument_metadata.get(symbol)
+    return meta["lot_size"] if meta else 1
 
 
 def resolve_tokens(instrument_map: dict[str, int], watchlist: list[str]) -> dict[str, int]:

@@ -17,13 +17,12 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 FROM python:3.11-slim
 
 LABEL maintainer="WOLFIEEEE"
-LABEL description="Kite Intraday Trading Bot — NSE automated trading"
+LABEL description="Kite Intraday Trading Bot — NSE automated trading with live dashboard"
 
 WORKDIR /app
 
-# Install only runtime dependencies (tkinter for GUI, sqlite3 for DB)
+# Install only runtime dependencies (sqlite3 for DB, curl for healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-tk \
     libsqlite3-0 \
     curl \
     tzdata \
@@ -43,31 +42,31 @@ COPY . .
 RUN mkdir -p /app/logs /app/data /app/config
 
 # Volume mounts:
-#   /app/data    — persistent SQLite database + access token cache
+#   /app/data    — persistent SQLite database + access token + evolution state
 #   /app/logs    — log files
 #   /app/config  — .env file with API credentials
 VOLUME ["/app/data", "/app/logs", "/app/config"]
 
-# Override default DB path to persistent volume
+# ── Environment defaults (override via Coolify env vars) ─────────────
 ENV DATABASE_URL=sqlite:////app/data/trades.db
 ENV LOG_FILE=/app/logs/trading_bot.log
 ENV ACCESS_TOKEN_FILE=/app/data/access_token.txt
+ENV DASHBOARD_PORT=5000
+ENV DASHBOARD_HOST=0.0.0.0
 
-# Health check: verify Python and dependencies are importable
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import kiteconnect; import pandas; print('OK')" || exit 1
+# Health check: hit the dashboard /health endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:${DASHBOARD_PORT}/health || exit 1
 
 # Make entrypoint executable
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
-# Expose no ports by default (bot connects outbound to Kite API)
-# Port 5555 for OAuth callback if using auto-auth
-EXPOSE 5555
+# Expose dashboard port (Coolify will map this)
+EXPOSE ${DASHBOARD_PORT}
 
 # Entrypoint: validates env, inits DB, prints config summary
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
-# Default: run the trading bot (headless mode)
-# Override with: docker run ... python gui/launcher.py  (for GUI mode)
+# Default: run the trading bot (includes dashboard)
 CMD ["python", "main.py"]

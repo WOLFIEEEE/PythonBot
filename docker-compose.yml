@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   trading-bot:
     build:
@@ -9,6 +7,7 @@ services:
     restart: unless-stopped
 
     # Environment variables (override defaults from Dockerfile)
+    # On Coolify: set these in the Coolify UI environment variables section
     env_file:
       - ./config/.env
 
@@ -17,6 +16,15 @@ services:
       - LOG_FILE=/app/logs/trading_bot.log
       - LOG_LEVEL=INFO
       - TZ=Asia/Kolkata
+      # Dashboard config
+      - DASHBOARD_PORT=5000
+      - DASHBOARD_HOST=0.0.0.0
+      # Set a strong password hash (SHA-256 of your password)
+      # Generate: python -c "import hashlib; print(hashlib.sha256(b'YOUR_PASSWORD').hexdigest())"
+      # Default: admin123
+      # - DASHBOARD_PASSWORD_HASH=your_sha256_hash_here
+      # Skip market day check (useful for testing dashboard outside trading hours)
+      # - SKIP_MARKET_DAY_CHECK=true
 
     # Persistent volumes
     volumes:
@@ -27,11 +35,11 @@ services:
       # Config mount (bind mount your .env + overrides here)
       - ./config:/app/config:ro
 
-    # OAuth callback port (only needed during initial authentication)
+    # Dashboard port — Coolify will reverse-proxy to this
     ports:
-      - "5555:5555"
+      - "${DASHBOARD_PORT:-5000}:5000"
 
-    # Resource limits to prevent runaway memory/CPU
+    # Resource limits
     deploy:
       resources:
         limits:
@@ -41,13 +49,13 @@ services:
           cpus: "0.25"
           memory: 128M
 
-    # Health check
+    # Health check via dashboard HTTP endpoint
     healthcheck:
-      test: ["CMD", "python", "-c", "import kiteconnect; print('OK')"]
-      interval: 60s
-      timeout: 10s
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 15s
 
     # Stop gracefully (SIGTERM → square-off → shutdown)
     stop_grace_period: 60s

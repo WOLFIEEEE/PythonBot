@@ -92,6 +92,14 @@ class CandleAggregator:
                 return None
         self._last_valid_price[symbol] = ltp
 
+        # Extract prev_day_close from MODE_FULL tick's ohlc.close field
+        # (Kite MODE_FULL provides ohlc.close = previous trading day's close)
+        tick_ohlc = tick.get("ohlc")
+        if tick_ohlc and symbol not in self._prev_day_close:
+            prev_close = tick_ohlc.get("close", 0)
+            if prev_close > 0:
+                self._prev_day_close[symbol] = prev_close
+
         cum_volume = tick.get("volume_traded", 0)
         ts = tick.get("exchange_timestamp") or datetime.now()
 
