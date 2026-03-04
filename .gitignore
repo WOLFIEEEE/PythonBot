@@ -1,0 +1,39 @@
+# Secrets & tokens
+config/.env
+.env
+access_token.txt
+
+# Database
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+
+# Backtest data
+backtest/data/
+
+# OS
+.DS_Store
+Thumbs.db
