@@ -1,0 +1,67 @@
+version: "3.9"
+
+services:
+  trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kite-trading-bot
+    restart: unless-stopped
+
+    # Environment variables (override defaults from Dockerfile)
+    env_file:
+      - ./config/.env
+
+    environment:
+      - DATABASE_URL=sqlite:////app/data/trades.db
+      - LOG_FILE=/app/logs/trading_bot.log
+      - LOG_LEVEL=INFO
+      - TZ=Asia/Kolkata
+
+    # Persistent volumes
+    volumes:
+      # Trade database (SQLite) — survives container restarts
+      - bot-data:/app/data
+      # Log files — accessible from host
+      - bot-logs:/app/logs
+      # Config mount (bind mount your .env + overrides here)
+      - ./config:/app/config:ro
+
+    # OAuth callback port (only needed during initial authentication)
+    ports:
+      - "5555:5555"
+
+    # Resource limits to prevent runaway memory/CPU
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import kiteconnect; print('OK')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # Stop gracefully (SIGTERM → square-off → shutdown)
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes for persistence
+volumes:
+  bot-data:
+    driver: local
+  bot-logs:
+    driver: local

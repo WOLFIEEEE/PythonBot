@@ -74,7 +74,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = os.getenv("LOG_FILE", "logs/trading_bot.log")
 
 # ── Session / Token cache ────────────────────────────────────────────
-ACCESS_TOKEN_FILE = "access_token.txt"
+ACCESS_TOKEN_FILE = os.getenv("ACCESS_TOKEN_FILE", "access_token.txt")
 
 # ── Resilience ───────────────────────────────────────────────────────
 API_RETRY_COUNT = 3
