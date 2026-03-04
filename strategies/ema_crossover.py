@@ -78,7 +78,7 @@ class EMACrossoverStrategy(BaseStrategy):
 
         if cross_up and above_vwap and vol_ok and 40 <= rsi <= 70:
             return "BUY"
-        if cross_down and below_vwap and 30 <= rsi <= 60:
+        if cross_down and below_vwap and vol_ok and 30 <= rsi <= 60:
             return "SELL"
         return "HOLD"
 

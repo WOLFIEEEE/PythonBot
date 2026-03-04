@@ -34,6 +34,11 @@ class Position:
     target_price: float = 0.0
     trailing_sl: float = 0.0
     current_pnl: float = 0.0
+    # Scaled entry tracking
+    total_planned_qty: int = 0       # Full intended quantity
+    scale_in_remaining: int = 0      # Shares still to add
+    scale_in_candles_waited: int = 0 # Candles since entry (for timing add-ons)
+    scale_in_complete: bool = True   # True if no more add-ons needed
 
 
 class PositionTracker:
@@ -163,6 +168,47 @@ class PositionTracker:
             pos.direction, symbol, exit_price, net_pnl, exit_reason,
         )
         return trade_record
+
+    # ── Scale-in: add shares to existing position ──────────────────
+    def add_to_position(
+        self,
+        symbol: str,
+        additional_qty: int,
+        fill_price: float,
+    ) -> bool:
+        """
+        Add shares to an existing position (scale-in).
+        Updates average entry price and quantity.
+        Returns True if successful.
+        """
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if pos is None:
+                return False
+
+            old_cost = pos.entry_price * pos.quantity
+            new_cost = fill_price * additional_qty
+            new_qty = pos.quantity + additional_qty
+            pos.entry_price = round((old_cost + new_cost) / new_qty, 2)
+            pos.quantity = new_qty
+            pos.scale_in_remaining = max(0, pos.scale_in_remaining - additional_qty)
+            if pos.scale_in_remaining == 0:
+                pos.scale_in_complete = True
+
+        log.info(
+            "Scale-in: %s %s +%d shares @ %.2f — total qty=%d avg=%.2f",
+            pos.direction, symbol, additional_qty, fill_price, new_qty, pos.entry_price,
+        )
+        return True
+
+    def increment_scale_candle(self, symbol: str) -> int:
+        """Increment the scale-in candle counter. Returns new count."""
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if pos is None:
+                return 0
+            pos.scale_in_candles_waited += 1
+            return pos.scale_in_candles_waited
 
     # ── Update unrealized P&L from live prices ───────────────────────
     def update_unrealized_pnl(self, live_prices: dict[str, float]) -> None:

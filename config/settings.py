@@ -32,6 +32,23 @@ SUPERTREND_MULTIPLIER = 3.0
 ORB_CANDLE_MINUTES = 15          # First 15-min candle for ORB
 VWAP_DEVIATION_THRESHOLD = 0.5   # % above/below VWAP
 
+# ── Session-Based Strategy Rotation (IST) ───────────────────────────
+# Different strategies work better in different market sessions.
+# Format: list of (start_time, end_time, [strategy_names])
+# Strategy names must match the .name attribute of each strategy class.
+SESSION_STRATEGY_MAP = {
+    "opening":  {"start": "09:15", "end": "10:30", "strategies": ["ORB", "VWAP Breakout"]},
+    "midday":   {"start": "10:30", "end": "14:00", "strategies": ["EMA Crossover", "Supertrend", "ORB", "VWAP Breakout"]},
+    "closing":  {"start": "14:00", "end": "15:10", "strategies": ["Supertrend", "ORB"]},
+}
+
+# ── Gap Filter ──────────────────────────────────────────────────────
+GAP_FILTER_PCT = 1.0             # Skip first 2 candles if open gaps > 1% from prev close
+GAP_FILTER_SKIP_CANDLES = 2      # Number of candles to skip after a large gap
+
+# ── Liquidity Gate ──────────────────────────────────────────────────
+MIN_AVG_VOLUME = 500_000         # Minimum 20-period average volume to trade
+
 # ── Instruments (NSE Equity) ─────────────────────────────────────────
 WATCHLIST = [
     "NSE:RELIANCE",

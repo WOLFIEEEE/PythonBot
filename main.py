@@ -78,6 +78,20 @@ def on_new_candle(symbol: str, df: pd.DataFrame) -> None:
         log.warning("Stale data for %s — skipping signal evaluation.", symbol)
         return
 
+    # Gap filter: check opening gap on first candle, skip early candles if gap is large
+    if data_feed:
+        candle_count = data_feed.aggregator.get_candle_count(symbol)
+        if candle_count == 1 and len(df) > 0:
+            open_price = df.iloc[0]["open"]
+            data_feed.aggregator.check_opening_gap(symbol, open_price)
+
+        if data_feed.aggregator.should_skip_for_gap(symbol):
+            log.info("Skipping %s — gap filter active (early candles after large gap).", symbol)
+            # Still manage existing positions even during gap skip
+            with _signal_lock:
+                _manage_open_positions(symbol)
+            return
+
     with _signal_lock:
         try:
             _process_signal(symbol, df)
@@ -154,15 +168,20 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         log.info("Slot reservation failed for %s (max positions or duplicate).", symbol)
         return
 
-    qty = risk_mgr.calculate_quantity(
+    total_qty = risk_mgr.calculate_quantity(
         settings.TOTAL_CAPITAL,
         settings.RISK_PER_TRADE_PCT,
         entry_price,
         sl_price,
     )
 
-    # Place entry order
-    entry_oid = order_mgr.place_entry_order(symbol, signal_val, qty)
+    # Scaled entry: start with 50% of planned quantity.
+    # Remaining 25% added on each of the next 2 candles if price holds.
+    initial_qty = max(1, total_qty // 2)
+    scale_in_remaining = total_qty - initial_qty
+
+    # Place entry order (initial tranche)
+    entry_oid = order_mgr.place_entry_order(symbol, signal_val, initial_qty)
     if not entry_oid:
         pos_tracker.release_slot(symbol)
         return
@@ -189,25 +208,25 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         exit_dir = "BUY"
 
     # Place SL order — CRITICAL: if this fails, emergency exit
-    sl_oid = order_mgr.place_sl_order(symbol, exit_dir, qty, sl_price)
+    sl_oid = order_mgr.place_sl_order(symbol, exit_dir, initial_qty, sl_price)
     if sl_oid is None:
         log.error("SL placement failed for %s — initiating emergency exit.", symbol)
-        order_mgr.emergency_exit(symbol, exit_dir, qty)
+        order_mgr.emergency_exit(symbol, exit_dir, initial_qty)
         return
 
     # Place target order (non-critical — position is still protected by SL)
-    tgt_oid = order_mgr.place_target_order(symbol, exit_dir, qty, target_price)
+    tgt_oid = order_mgr.place_target_order(symbol, exit_dir, initial_qty, target_price)
 
     # Determine winning strategy from confluence engine
     sig_info = strategy_engine.last_signals.get(symbol, {})
     winning_strategy = sig_info.get("strategy", "Confluence")
 
-    # Track the position
-    pos_tracker.open_position(
+    # Track the position (with scale-in metadata)
+    pos = pos_tracker.open_position(
         symbol=symbol,
         direction=signal_val,
         entry_price=fill_price,
-        quantity=qty,
+        quantity=initial_qty,
         sl_price=sl_price,
         target_price=target_price,
         strategy=winning_strategy,
@@ -215,19 +234,72 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         sl_order_id=sl_oid,
         target_order_id=tgt_oid,
     )
+    # Set scale-in tracking fields
+    pos.total_planned_qty = total_qty
+    pos.scale_in_remaining = scale_in_remaining
+    pos.scale_in_candles_waited = 0
+    pos.scale_in_complete = (scale_in_remaining == 0)
 
-    risk_amount = abs(fill_price - sl_price) * qty
+    risk_amount = abs(fill_price - sl_price) * initial_qty
     notify_trade_entry(
-        symbol, signal_val, fill_price, qty, sl_price, target_price,
+        symbol, signal_val, fill_price, initial_qty, sl_price, target_price,
         winning_strategy, risk_amount,
     )
 
 
 def _manage_open_positions(symbol: str) -> None:
-    """Check SL/target fills, update trailing SL for an open position."""
+    """Check SL/target fills, scale-in add-ons, update trailing SL for an open position."""
     pos = pos_tracker.get_position(symbol)
     if pos is None:
         return
+
+    # Scale-in: add 25% of planned quantity on each of the next 2 candles
+    # Only if price is still moving in our favour (not reversing)
+    if not pos.scale_in_complete and pos.scale_in_remaining > 0:
+        candle_count = pos_tracker.increment_scale_candle(symbol)
+        ltp = data_feed.get_ltp(symbol) if data_feed else None
+
+        # Add on candle 1 and candle 2 after entry
+        if candle_count in (1, 2) and ltp:
+            price_ok = False
+            if pos.direction == "BUY" and ltp > pos.entry_price:
+                price_ok = True  # Price moving up — confirm BUY
+            elif pos.direction == "SELL" and ltp < pos.entry_price:
+                price_ok = True  # Price moving down — confirm SELL
+
+            if price_ok:
+                addon_qty = max(1, pos.total_planned_qty // 4)
+                addon_qty = min(addon_qty, pos.scale_in_remaining)
+                addon_oid = order_mgr.place_entry_order(symbol, pos.direction, addon_qty)
+                if addon_oid:
+                    fill_status = order_mgr.wait_for_fill(addon_oid, timeout=10)
+                    if fill_status == "COMPLETE":
+                        addon_fill = order_mgr.get_fill_price(addon_oid) or ltp
+                        pos_tracker.add_to_position(symbol, addon_qty, addon_fill)
+                        # Update SL/target orders for new total quantity
+                        new_total_qty = pos.quantity  # already updated by add_to_position
+                        exit_dir = "SELL" if pos.direction == "BUY" else "BUY"
+                        if pos.sl_order_id:
+                            order_mgr.cancel_order(pos.sl_order_id)
+                            new_sl_oid = order_mgr.place_sl_order(
+                                symbol, exit_dir, new_total_qty, pos.trailing_sl,
+                            )
+                            if new_sl_oid:
+                                pos.sl_order_id = new_sl_oid
+                        if pos.target_order_id:
+                            order_mgr.cancel_order(pos.target_order_id)
+                            new_tgt_oid = order_mgr.place_target_order(
+                                symbol, exit_dir, new_total_qty, pos.target_price,
+                            )
+                            if new_tgt_oid:
+                                pos.target_order_id = new_tgt_oid
+                    else:
+                        if fill_status != "REJECTED":
+                            order_mgr.cancel_order(addon_oid)
+            else:
+                # Price reversed — skip remaining scale-ins
+                log.info("Scale-in skipped for %s: price not confirming direction.", symbol)
+                pos.scale_in_complete = True
 
     # Check SL order
     if pos.sl_order_id:
@@ -497,13 +569,35 @@ def main() -> None:
         min_agreement=2,
     )
 
-    # 5. Start WebSocket data feed
+    # 5. Load previous-day close prices for gap detection
+    log.info("Loading previous-day close prices for gap filter...")
+    try:
+        ohlc_data = kite.ohlc([f"{settings.EXCHANGE}:{sym}" for sym in token_map])
+        for key, val in ohlc_data.items():
+            sym = key.split(":")[-1]
+            prev_close = val.get("ohlc", {}).get("close", 0)
+            if prev_close > 0:
+                # Will be set on the aggregator after DataFeed init
+                pass
+    except Exception as exc:
+        log.warning("Failed to load prev-day closes for gap filter: %s", exc)
+        ohlc_data = {}
+
+    # 6. Start WebSocket data feed
     data_feed = DataFeed(
         access_token=kite.access_token,
         token_symbol_map=inv_map,
         on_candle=on_new_candle,
         candle_interval=settings.CANDLE_INTERVAL_MINUTES,
     )
+
+    # Set previous-day close on aggregator for gap detection
+    for key, val in ohlc_data.items():
+        sym = key.split(":")[-1]
+        prev_close = val.get("ohlc", {}).get("close", 0)
+        if prev_close > 0:
+            data_feed.aggregator.set_prev_day_close(sym, prev_close)
+
     data_feed.start()
 
     # 6. Schedule periodic tasks

@@ -51,6 +51,10 @@ class CandleAggregator:
         self._candle_start_volume: dict[str, int] = {}
         # Last known valid price per instrument (for price band filtering)
         self._last_valid_price: dict[str, float] = {}
+        # Previous day close per instrument (for gap detection)
+        self._prev_day_close: dict[str, float] = {}
+        # Gap detection: symbols with large opening gaps (skip early candles)
+        self._gap_symbols: dict[str, int] = {}  # symbol -> candles remaining to skip
 
     def _floor_time(self, dt: datetime) -> datetime:
         """Floor datetime to the candle interval boundary."""
@@ -159,6 +163,38 @@ class CandleAggregator:
     def get_candle_count(self, symbol: str) -> int:
         """Number of completed candles for a symbol."""
         return len(self._candles[symbol])
+
+    def set_prev_day_close(self, symbol: str, close: float) -> None:
+        """Store previous day's close for gap detection."""
+        self._prev_day_close[symbol] = close
+
+    def check_opening_gap(self, symbol: str, open_price: float) -> bool:
+        """
+        Check if the stock gapped significantly from previous close.
+        Returns True if gap is > GAP_FILTER_PCT.
+        """
+        from config import settings as _s
+        prev_close = self._prev_day_close.get(symbol)
+        if prev_close is None or prev_close <= 0:
+            return False
+        gap_pct = abs(open_price - prev_close) / prev_close * 100
+        if gap_pct > _s.GAP_FILTER_PCT:
+            self._gap_symbols[symbol] = _s.GAP_FILTER_SKIP_CANDLES
+            log.warning(
+                "Gap detected for %s: open=%.2f prev_close=%.2f gap=%.1f%% — "
+                "skipping %d candles.",
+                symbol, open_price, prev_close, gap_pct, _s.GAP_FILTER_SKIP_CANDLES,
+            )
+            return True
+        return False
+
+    def should_skip_for_gap(self, symbol: str) -> bool:
+        """Check if we should skip signals for this symbol due to opening gap."""
+        remaining = self._gap_symbols.get(symbol, 0)
+        if remaining > 0:
+            self._gap_symbols[symbol] = remaining - 1
+            return True
+        return False
 
 
 class DataFeed:

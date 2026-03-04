@@ -121,7 +121,13 @@ class RiskManager:
             if blocked:
                 return False, reason
 
-        # 10 — Minimum SL distance sanity check
+        # 10 — Minimum liquidity check (average volume must meet threshold)
+        if candle_df is not None and not candle_df.empty:
+            blocked, reason = self._liquidity_filter(symbol, candle_df)
+            if blocked:
+                return False, reason
+
+        # 11 — Minimum SL distance sanity check
         sl_distance_pct = abs(entry_price - sl_price) / entry_price * 100
         if sl_distance_pct < 0.05:
             return False, f"SL too tight ({sl_distance_pct:.3f}%) — likely bad data."
@@ -157,6 +163,33 @@ class RiskManager:
             reason = (
                 f"Volatility too high for {symbol}: "
                 f"ATR={current_atr:.2f} > 2x avg ATR={avg_atr:.2f}"
+            )
+            log.warning(reason)
+            return True, reason
+
+        return False, ""
+
+    # ── Liquidity filter ─────────────────────────────────────────────
+    def _liquidity_filter(
+        self, symbol: str, df: pd.DataFrame
+    ) -> tuple[bool, str]:
+        """
+        Block trade if average volume is below MIN_AVG_VOLUME.
+        Illiquid stocks have wide spreads and SL orders may not fill.
+        Returns (blocked: bool, reason: str).
+        """
+        min_vol = getattr(settings, "MIN_AVG_VOLUME", 0)
+        if min_vol <= 0 or len(df) < 5:
+            return False, ""
+
+        avg_vol = df["volume"].tail(20).mean()
+        if pd.isna(avg_vol):
+            return False, ""
+
+        if avg_vol < min_vol:
+            reason = (
+                f"Liquidity too low for {symbol}: "
+                f"avg_volume={avg_vol:.0f} < min={min_vol}"
             )
             log.warning(reason)
             return True, reason

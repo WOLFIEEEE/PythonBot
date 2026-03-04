@@ -12,13 +12,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from enum import Enum
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from config import settings
+from utils.helpers import now_ist
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -161,17 +163,44 @@ class StrategyEngine:
         # Strategy weights (can be customised)
         self._weights: dict[str, float] = {}
 
+    # ── Session-based strategy filtering ────────────────────────────
+    def _get_active_strategies(self) -> list[type[BaseStrategy]]:
+        """
+        Return only the strategy classes that are active for the current
+        NSE session window. Falls back to all strategies if no session matches.
+        """
+        session_map = getattr(settings, "SESSION_STRATEGY_MAP", None)
+        if not session_map:
+            return self.strategy_classes
+
+        current = now_ist().time()
+        for session_info in session_map.values():
+            start_h, start_m = map(int, session_info["start"].split(":"))
+            end_h, end_m = map(int, session_info["end"].split(":"))
+            start = dt_time(start_h, start_m)
+            end = dt_time(end_h, end_m)
+
+            if start <= current < end:
+                allowed = set(session_info["strategies"])
+                active = [cls for cls in self.strategy_classes if cls.name in allowed]
+                if active:
+                    return active
+                break  # Session matched but no strategies — fall through
+
+        return self.strategy_classes
+
     def evaluate(self, instrument: str, df: pd.DataFrame) -> str:
         """
         Evaluate all strategies and return the consensus signal.
 
         Algorithm:
           1. Detect market regime
-          2. Run all strategies → collect Signal objects
-          3. Compute weighted score for BUY and SELL
-          4. Apply regime-adaptive threshold
-          5. Require min_agreement strategies to agree
-          6. Return final signal
+          2. Filter strategies by session time window
+          3. Run active strategies → collect Signal objects
+          4. Compute weighted score for BUY and SELL
+          5. Apply regime-adaptive threshold
+          6. Require min_agreement strategies to agree
+          7. Return final signal
         """
         if df.empty or len(df) < 10:
             return "HOLD"
@@ -179,9 +208,12 @@ class StrategyEngine:
         # 1. Market regime
         regime = detect_regime(df)
 
-        # 2. Run strategies
+        # 2. Filter by session
+        active_strategies = self._get_active_strategies()
+
+        # 3. Run strategies
         signals: list[Signal] = []
-        for cls in self.strategy_classes:
+        for cls in active_strategies:
             try:
                 strat = cls(instrument, df.copy())
                 sig = strat.compute_signal_strength()
@@ -202,11 +234,13 @@ class StrategyEngine:
 
         # 4. Regime-adaptive threshold
         threshold = self._regime_threshold(regime)
-        effective_agreement = max(1, self.min_agreement)
+        # Scale agreement threshold to active strategy count
+        # (e.g., if only 2 strategies active, don't require 3 to agree)
+        effective_agreement = min(max(1, self.min_agreement), len(active_strategies))
 
         # In volatile regimes, require stronger consensus
         if regime == MarketRegime.VOLATILE:
-            effective_agreement = min(len(self.strategy_classes), self.min_agreement + 1)
+            effective_agreement = min(len(active_strategies), effective_agreement + 1)
 
         # 5. Final decision
         final = "HOLD"

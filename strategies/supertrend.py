@@ -68,6 +68,16 @@ class SupertrendStrategy(BaseStrategy):
     def compute_indicators(self) -> None:
         _compute_supertrend(self.df)
 
+        # RSI(14) — required for confirmation filter
+        df = self.df
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        df["rsi"] = 100 - (100 / (1 + rs))
+
     def generate_signal(self) -> str:
         df = self.df
         if len(df) < MIN_CANDLES:
@@ -85,17 +95,23 @@ class SupertrendStrategy(BaseStrategy):
         prev_dir = int(prev["st_direction"])
         curr_dir = int(curr["st_direction"])
 
+        rsi = curr.get("rsi", 50)
+        if pd.isna(rsi):
+            rsi = 50
+
         # Crossover: direction changed from -1 to 1 -> BUY
-        if prev_dir == -1 and curr_dir == 1:
+        # RSI confirmation: require RSI > 50 for BUY (momentum aligned)
+        if prev_dir == -1 and curr_dir == 1 and rsi > 50:
             return "BUY"
         # Crossover: direction changed from 1 to -1 -> SELL
-        if prev_dir == 1 and curr_dir == -1:
+        # RSI confirmation: require RSI < 50 for SELL (momentum aligned)
+        if prev_dir == 1 and curr_dir == -1 and rsi < 50:
             return "SELL"
 
         return "HOLD"
 
     def compute_signal_strength(self) -> Signal:
-        """Score based on distance from supertrend line and ATR context."""
+        """Score based on distance from supertrend line, RSI strength, and ATR context."""
         if self.df.empty or len(self.df) < MIN_CANDLES:
             return Signal("HOLD", 0.0, self.name)
 
@@ -105,14 +121,21 @@ class SupertrendStrategy(BaseStrategy):
             return Signal("HOLD", 0.0, self.name)
 
         curr = self.df.iloc[-1]
-        score = 0.5  # Base: direction crossover happened
+        score = 0.4  # Base: direction crossover + RSI confirmed
 
         # Distance from supertrend line — bigger gap = stronger signal
         st_val = curr.get("supertrend", 0)
         atr = curr.get("atr", 0)
         if atr > 0 and st_val > 0:
             dist = abs(curr["close"] - st_val) / atr
-            score += min(dist * 0.15, 0.3)
+            score += min(dist * 0.15, 0.25)
+
+        # RSI strength bonus — RSI further from 50 = more conviction
+        rsi = curr.get("rsi", 50)
+        if direction == "BUY" and rsi > 55:
+            score += min((rsi - 50) / 40, 0.15)
+        elif direction == "SELL" and rsi < 45:
+            score += min((50 - rsi) / 40, 0.15)
 
         # Volume boost
         vol_avg = self.df["volume"].rolling(20).mean().iloc[-1]
