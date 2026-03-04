@@ -8,6 +8,7 @@ external close detection, stale data skipping, auto-evolution.
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
 import threading
@@ -26,6 +27,13 @@ from core.order_manager import OrderManager
 from core.position_tracker import PositionTracker
 from core.risk_manager import RiskManager
 from core.strategy import StrategyEngine
+from dashboard import (
+    broadcast_state,
+    push_trade_event,
+    push_update,
+    set_bot_references,
+    start_dashboard,
+)
 from strategies.ema_crossover import EMACrossoverStrategy
 from strategies.orb import ORBStrategy
 from strategies.supertrend import SupertrendStrategy
@@ -283,6 +291,15 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         winning_strategy, risk_amount,
     )
 
+    # Push trade entry to live dashboard
+    push_trade_event({
+        "instrument": symbol, "direction": signal_val,
+        "entry_price": fill_price, "quantity": initial_qty,
+        "sl_price": sl_price, "target_price": target_price,
+        "strategy": winning_strategy,
+    }, event_type="entry")
+    push_update()
+
 
 def _manage_open_positions(symbol: str) -> None:
     """Check SL/target fills, scale-in add-ons, update trailing SL for an open position."""
@@ -394,6 +411,9 @@ def _log_and_notify_exit(trade: dict) -> None:
         trade["exit_reason"],
         trade["duration_min"],
     )
+    # Push trade exit to live dashboard
+    push_trade_event(trade, event_type="exit")
+    push_update()
 
 
 def _persist_trade(trade: dict) -> None:
@@ -570,6 +590,8 @@ def _graceful_shutdown(signum=None, frame=None) -> None:
         return  # Prevent double shutdown
     log.info("Shutdown signal received — cleaning up...")
     shutdown_event.set()
+    set_bot_references(bot_running=False)
+    push_update()
 
     _square_off_all()
     _daily_summary()
@@ -638,6 +660,21 @@ def main() -> None:
     strategy_engine._adaptive_engine = adaptive
     log.info("Adaptive engine: %s", adaptive.status)
 
+    # 4c. Start web dashboard (password-protected live view)
+    dashboard_port = int(os.environ.get("DASHBOARD_PORT", 5000))
+    start_dashboard(host="0.0.0.0", port=dashboard_port)
+    set_bot_references(
+        pos_tracker=pos_tracker,
+        risk_mgr=risk_mgr,
+        strategy_engine=strategy_engine,
+        data_feed=data_feed,
+        adaptive_engine=adaptive,
+        order_mgr=order_mgr,
+        bot_running=True,
+        start_time=now_ist().isoformat(),
+    )
+    log.info("Web dashboard started on port %d", dashboard_port)
+
     # 5. Load previous-day close prices for gap detection
     log.info("Loading previous-day close prices for gap filter...")
     try:
@@ -668,6 +705,9 @@ def main() -> None:
             data_feed.aggregator.set_prev_day_close(sym, prev_close)
 
     data_feed.start()
+
+    # Update dashboard reference now that data_feed is ready
+    set_bot_references(data_feed=data_feed)
 
     # 6. Schedule periodic tasks
     scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
@@ -716,6 +756,14 @@ def main() -> None:
         hour=mc_h,
         minute=mc_m,
         id="daily_summary",
+    )
+
+    # Dashboard live state broadcast every 3 seconds
+    scheduler.add_job(
+        broadcast_state,
+        "interval",
+        seconds=3,
+        id="dashboard_broadcast",
     )
 
     scheduler.start()

@@ -96,6 +96,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///trades.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = os.getenv("LOG_FILE", "logs/trading_bot.log")
 
+# ── Web Dashboard ──────────────────────────────────────────────────
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5000"))
+# Set DASHBOARD_PASSWORD_HASH env var to SHA-256 hex of your chosen password.
+# Default password: admin123  (CHANGE THIS IN PRODUCTION)
+# Generate hash: python -c "import hashlib; print(hashlib.sha256(b'YOUR_PASSWORD').hexdigest())"
+
 # ── Session / Token cache ────────────────────────────────────────────
 ACCESS_TOKEN_FILE = os.getenv("ACCESS_TOKEN_FILE", "access_token.txt")
 

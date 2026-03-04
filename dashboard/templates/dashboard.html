@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Bot — Live Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+</head>
+<body>
+    <!-- ══ Top Nav Bar ══ -->
+    <nav class="topbar">
+        <div class="topbar-left">
+            <span class="logo">&#x1F4CA;</span>
+            <span class="brand">Trading Bot</span>
+            <span id="bot-status" class="status-badge status-offline">OFFLINE</span>
+        </div>
+        <div class="topbar-right">
+            <span id="feed-status" class="feed-badge">&#x25CF; Feed</span>
+            <span id="clock" class="clock">--:--:--</span>
+            <a href="/logout" class="logout-btn">Logout</a>
+        </div>
+    </nav>
+
+    <!-- ══ P&L Summary Cards ══ -->
+    <div class="cards-row">
+        <div class="card">
+            <div class="card-label">Realized P&L</div>
+            <div class="card-value" id="realized-pnl">--</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Unrealized P&L</div>
+            <div class="card-value" id="unrealized-pnl">--</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Total P&L</div>
+            <div class="card-value card-value-lg" id="total-pnl">--</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Trades Today</div>
+            <div class="card-value" id="trades-today">--</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Win Rate</div>
+            <div class="card-value" id="win-rate">--</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Open Positions</div>
+            <div class="card-value" id="open-count">--</div>
+        </div>
+    </div>
+
+    <!-- ══ Risk Meter ══ -->
+    <div class="risk-section">
+        <div class="risk-bar-container">
+            <div class="risk-bar-label">
+                <span>Daily Loss Budget</span>
+                <span id="risk-text">0% used</span>
+            </div>
+            <div class="risk-bar-track">
+                <div class="risk-bar-fill" id="risk-bar" style="width: 0%"></div>
+            </div>
+        </div>
+        <div class="risk-info">
+            <span id="risk-trades">Trades: 0/0</span>
+            <span id="risk-consec">Consec. Losses: 0</span>
+            <span id="risk-capital">Capital: --</span>
+        </div>
+    </div>
+
+    <!-- ══ Tab Navigation ══ -->
+    <div class="tab-bar">
+        <button class="tab active" data-tab="positions">Open Positions</button>
+        <button class="tab" data-tab="trades">Trade Log</button>
+        <button class="tab" data-tab="signals">Strategy Signals</button>
+        <button class="tab" data-tab="adaptive">Adaptive Engine</button>
+        <button class="tab" data-tab="logs">Bot Logs</button>
+        <button class="tab" data-tab="history">History</button>
+    </div>
+
+    <!-- ══ Tab: Open Positions ══ -->
+    <div class="tab-content active" id="tab-positions">
+        <div class="table-wrap">
+            <table id="positions-table">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Direction</th>
+                        <th>Entry</th>
+                        <th>Qty</th>
+                        <th>SL</th>
+                        <th>Trail SL</th>
+                        <th>Target</th>
+                        <th>P&L</th>
+                        <th>Strategy</th>
+                        <th>Entry Time</th>
+                    </tr>
+                </thead>
+                <tbody id="positions-body">
+                    <tr class="empty-row"><td colspan="10">No open positions</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- ══ Tab: Trade Log ══ -->
+    <div class="tab-content" id="tab-trades">
+        <div class="table-wrap">
+            <table id="trades-table">
+                <thead>
+                    <tr>
+                        <th>Exit Time</th>
+                        <th>Symbol</th>
+                        <th>Direction</th>
+                        <th>Entry</th>
+                        <th>Exit</th>
+                        <th>Qty</th>
+                        <th>P&L</th>
+                        <th>Reason</th>
+                        <th>Strategy</th>
+                        <th>Duration</th>
+                    </tr>
+                </thead>
+                <tbody id="trades-body">
+                    <tr class="empty-row"><td colspan="10">No trades yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- ══ Tab: Strategy Signals ══ -->
+    <div class="tab-content" id="tab-signals">
+        <div id="signals-container" class="signals-grid">
+            <p class="empty-text">Waiting for signals...</p>
+        </div>
+    </div>
+
+    <!-- ══ Tab: Adaptive Engine ══ -->
+    <div class="tab-content" id="tab-adaptive">
+        <div class="adaptive-grid">
+            <div class="adaptive-card">
+                <h3>Evolution Status</h3>
+                <div class="adaptive-row">
+                    <span>Evolution Cycles:</span>
+                    <span id="evo-count">0</span>
+                </div>
+                <div class="adaptive-row">
+                    <span>Last Evolved:</span>
+                    <span id="evo-last">--</span>
+                </div>
+                <div class="adaptive-row">
+                    <span>Trades Today:</span>
+                    <span id="evo-trades">0</span>
+                </div>
+                <div class="adaptive-row">
+                    <span>Regime Memory Entries:</span>
+                    <span id="evo-regime-count">0</span>
+                </div>
+            </div>
+            <div class="adaptive-card">
+                <h3>Current Weights</h3>
+                <div id="evo-weights" class="weights-list">
+                    <p class="empty-text">No evolved weights yet</p>
+                </div>
+            </div>
+            <div class="adaptive-card">
+                <h3>Parameter Overrides</h3>
+                <div id="evo-params" class="params-list">
+                    <p class="empty-text">No parameter overrides</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ Tab: Bot Logs ══ -->
+    <div class="tab-content" id="tab-logs">
+        <div class="log-controls">
+            <button id="log-refresh" class="btn-sm">Refresh Logs</button>
+            <label class="log-auto">
+                <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+            </label>
+        </div>
+        <div class="log-container" id="log-container"></div>
+    </div>
+
+    <!-- ══ Tab: History ══ -->
+    <div class="tab-content" id="tab-history">
+        <div class="table-wrap">
+            <table id="history-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Trades</th>
+                        <th>Wins</th>
+                        <th>Losses</th>
+                        <th>Net P&L</th>
+                        <th>Max Drawdown</th>
+                        <th>Win Rate</th>
+                    </tr>
+                </thead>
+                <tbody id="history-body">
+                    <tr class="empty-row"><td colspan="7">Loading history...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="pnl-chart-container">
+            <h3>Cumulative P&L</h3>
+            <canvas id="pnl-chart" height="200"></canvas>
+        </div>
+    </div>
+
+    <!-- ══ Emergency Controls ══ -->
+    <div class="bottom-bar">
+        <button class="btn-emergency" id="btn-squareoff"
+                onclick="emergencySquareOff()">
+            EMERGENCY SQUARE-OFF
+        </button>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
