@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from core.mtf_filter import mtf_confirms_signal
+from core.regime import AdvancedRegimeInfo, detect_advanced_regime
 from utils.helpers import now_ist
 from utils.logger import get_logger
 
@@ -208,8 +210,9 @@ class StrategyEngine:
         if df.empty or len(df) < 10:
             return "HOLD"
 
-        # 1. Market regime
-        regime = detect_regime(df)
+        # 1. Market regime (advanced detection with micro-regime, expiry, BB, etc.)
+        adv_regime = detect_advanced_regime(df)
+        regime = adv_regime.base_regime
 
         # 2. Filter by session
         active_strategies = self._get_active_strategies()
@@ -267,10 +270,29 @@ class StrategyEngine:
             final = "SELL"
             winning_strategy = sell_signals[0].strategy_name if sell_signals else ""
 
+        # 5b. Multi-timeframe confirmation — reject signals against 15-min trend
+        if final != "HOLD":
+            try:
+                if not mtf_confirms_signal(df, final):
+                    log.info(
+                        "%s | %s signal rejected by MTF filter (15-min trend mismatch)",
+                        instrument, final,
+                    )
+                    final = "HOLD"
+                    winning_strategy = ""
+            except Exception:
+                log.debug("MTF filter error for %s — allowing signal through.", instrument)
+
         # 6. Track for dashboard
         self.last_signals[instrument] = {
             "signal": final,
             "regime": regime.value,
+            "micro_regime": adv_regime.micro_regime.value,
+            "special_day": adv_regime.special_day.value,
+            "trend_strength": round(adv_regime.trend_strength, 2),
+            "volatility_percentile": round(adv_regime.volatility_percentile, 2),
+            "should_reduce_size": adv_regime.should_reduce_size,
+            "should_widen_sl": adv_regime.should_widen_sl,
             "buy_count": buy_count,
             "sell_count": sell_count,
             "buy_score": round(buy_score, 2),

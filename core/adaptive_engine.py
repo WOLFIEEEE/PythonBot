@@ -448,12 +448,29 @@ class AdaptiveEngine:
         new_weights = self._evolve_weights(perf)
         self.state.weights = new_weights
 
-        # 4. Evolve parameters
+        # 4. Evolve parameters — propose candidates
         old_params = dict(self.state.param_overrides)
-        new_params = self._evolve_parameters(trades)
-        self.state.param_overrides = new_params
+        candidate_params = self._evolve_parameters(trades)
 
-        # 5. Update regime memory
+        # 5. Backtest validation — only deploy params that pass walk-forward test
+        from core.backtester import validate_params
+        backtest_result = validate_params(
+            trades, candidate_params, current_params=old_params,
+        )
+        if backtest_result.get("approved"):
+            self.state.param_overrides = candidate_params
+            log.info(
+                "Evolution params APPROVED by backtest: improvement=%.1f%%",
+                backtest_result.get("improvement_pct", 0),
+            )
+        else:
+            log.info(
+                "Evolution params REJECTED by backtest: reason=%s — keeping current.",
+                backtest_result.get("reason", "unknown"),
+            )
+            # Keep old params — don't apply untested changes
+
+        # 6. Update regime memory
         self._update_regime_memory(perf)
 
         # 6. Set baseline if first evolution
@@ -465,7 +482,7 @@ class AdaptiveEngine:
         self.state.param_history.append({
             "date": date.today().isoformat(),
             "reverted": False,
-            "params": dict(new_params),
+            "params": dict(self.state.param_overrides),
             "weights": dict(new_weights),
         })
 
@@ -483,7 +500,7 @@ class AdaptiveEngine:
         }
         param_changes = {
             k: {"old": old_params.get(k, getattr(settings, k, "?")), "new": v}
-            for k, v in new_params.items()
+            for k, v in self.state.param_overrides.items()
             if old_params.get(k, getattr(settings, k, None)) != v
         }
 

@@ -20,6 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from config import settings
 from core.auth import authenticate
 from core.adaptive_engine import AdaptiveEngine
+from core.correlation import correlation_check
 from core.data_feed import DataFeed
 from core.order_manager import OrderManager
 from core.position_tracker import PositionTracker
@@ -163,6 +164,20 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         log.info("Trade blocked for %s: %s", symbol, reason)
         return
 
+    # Correlation check — prevent concentrated sector exposure and correlated positions
+    open_symbols = pos_tracker.get_open_symbols()
+    if open_symbols:
+        candle_data = {}
+        if data_feed:
+            for sym in open_symbols:
+                sym_df = data_feed.get_dataframe(sym)
+                if sym_df is not None and not sym_df.empty:
+                    candle_data[sym] = sym_df
+        blocked, reason = correlation_check(symbol, df, open_symbols, candle_data)
+        if blocked:
+            log.info("Trade blocked by correlation filter for %s: %s", symbol, reason)
+            return
+
     # Atomically reserve a position slot before placing the order.
     # This prevents two instruments from both passing MAX_OPEN_POSITIONS
     # check simultaneously and exceeding the limit.
@@ -176,6 +191,26 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         entry_price,
         sl_price,
     )
+
+    # Regime-based adjustments from advanced regime detection
+    sig_info = strategy_engine.last_signals.get(symbol, {})
+    if sig_info.get("should_reduce_size"):
+        # Reduce size by 40% on expiry days, open auction, or extreme volatility
+        total_qty = max(1, int(total_qty * 0.6))
+        log.info(
+            "%s | Position size reduced to %d (regime: %s, special: %s)",
+            symbol, total_qty,
+            sig_info.get("micro_regime", "?"), sig_info.get("special_day", "?"),
+        )
+
+    if sig_info.get("should_widen_sl"):
+        # Widen SL by 30% during volatile/expiry conditions
+        sl_widen = 1.3
+        if signal_val == "BUY":
+            sl_price = round(entry_price * (1 - settings.SL_PCT * sl_widen / 100), 2)
+        else:
+            sl_price = round(entry_price * (1 + settings.SL_PCT * sl_widen / 100), 2)
+        log.info("%s | SL widened to %.2f (volatile/expiry conditions)", symbol, sl_price)
 
     # Scaled entry: start with 50% of planned quantity.
     # Remaining 25% added on each of the next 2 candles if price holds.

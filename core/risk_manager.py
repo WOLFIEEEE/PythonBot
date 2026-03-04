@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from config import settings
+from core.correlation import check_sector_exposure
 from utils.helpers import is_past_no_new_trades_time, now_ist, retry
 from utils.logger import get_logger
 from utils.notifier import notify_risk_breach
@@ -133,6 +134,13 @@ class RiskManager:
             return False, f"SL too tight ({sl_distance_pct:.3f}%) — likely bad data."
         if sl_distance_pct > 5.0:
             return False, f"SL too wide ({sl_distance_pct:.1f}%) — excessive risk."
+
+        # 12 — Sector correlation check (prevent concentrated sector exposure)
+        open_symbols = list(position_tracker.positions.keys())
+        if open_symbols:
+            blocked, reason = check_sector_exposure(symbol, open_symbols)
+            if blocked:
+                return False, reason
 
         return True, "OK"
 
