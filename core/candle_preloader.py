@@ -39,8 +39,9 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# Kite historical API rate limit: 3 requests/sec — use 0.35s sleep to be safe
-_RATE_LIMIT_DELAY = 0.35
+# Kite historical API rate limit: 120 requests/minute (~2 req/sec).
+# Use 0.5s sleep between requests to stay safely under the limit.
+_RATE_LIMIT_DELAY = 0.5
 
 # How many days of historical candles to preload (provides enough warmup)
 _PRELOAD_DAYS = 5

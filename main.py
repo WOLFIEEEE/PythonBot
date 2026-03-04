@@ -686,7 +686,7 @@ def main() -> None:
 
     # 5a. Pre-load historical candles so strategies have warmup data immediately.
     # Without this, EMA needs 25 candles (125 min) before first signal — missing
-    # the entire 9:15-11:30 opening window. Historical API: 3 req/sec.
+    # the entire 9:15-11:30 opening window. Historical API: 120 req/min.
     from core.candle_preloader import preload_candles
     try:
         preload_result = preload_candles(kite, data_feed, token_map)
@@ -711,7 +711,10 @@ def main() -> None:
     except Exception as exc:
         log.warning("Failed to load prev-day closes: %s (will extract from live ticks)", exc)
 
-    # 5c. Start WebSocket for live ticks (historical candles already in aggregator)
+    # 5c. Give DataFeed a reference to kite for historical gap-fill on reconnect
+    data_feed.set_kite_ref(kite)
+
+    # 5d. Start WebSocket for live ticks (historical candles already in aggregator)
     data_feed.start()
 
     # Update dashboard reference now that data_feed is ready
