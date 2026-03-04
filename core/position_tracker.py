@@ -46,6 +46,30 @@ class PositionTracker:
         self.total_realized_pnl: float = 0.0
         self.total_unrealized_pnl: float = 0.0
         self.closed_trades: list[dict[str, Any]] = []
+        # Reserved slots: symbols with pending entry orders (atomic position count)
+        self._reserved_slots: set[str] = set()
+
+    # ── Atomic slot reservation ───────────────────────────────────────
+    def reserve_slot(self, symbol: str) -> bool:
+        """
+        Atomically reserve a position slot before placing the entry order.
+        Returns False if max positions reached or symbol already reserved/open.
+        This prevents the race condition where two instruments pass the
+        MAX_OPEN_POSITIONS check simultaneously.
+        """
+        with self._lock:
+            if symbol in self.positions or symbol in self._reserved_slots:
+                return False
+            total = len(self.positions) + len(self._reserved_slots)
+            if total >= settings.MAX_OPEN_POSITIONS:
+                return False
+            self._reserved_slots.add(symbol)
+            return True
+
+    def release_slot(self, symbol: str) -> None:
+        """Release a reserved slot (e.g., if entry order fails/rejected)."""
+        with self._lock:
+            self._reserved_slots.discard(symbol)
 
     # ── Open / close ─────────────────────────────────────────────────
     def open_position(
@@ -76,6 +100,8 @@ class PositionTracker:
                 target_order_id=target_order_id,
             )
             self.positions[symbol] = pos
+            # Clear reserved slot — now a real position
+            self._reserved_slots.discard(symbol)
         log.info(
             "Position opened: %s %s @ %.2f qty=%d SL=%.2f TGT=%.2f",
             direction, symbol, entry_price, quantity, sl_price, target_price,

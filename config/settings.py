@@ -57,6 +57,12 @@ SL_PCT = 0.5                     # 0.5% stop loss
 TARGET_PCT = 1.0                 # 1% target (RR = 1:2)
 TRAILING_SL = True               # Enable trailing stop loss
 TRAILING_SL_PCT = 0.3            # Trail by 0.3%
+SL_BUFFER_PCT = 0.1              # Limit price buffer beyond SL trigger (prevents SL-M slippage)
+
+# ── Zerodha Auto-Square-Off ────────────────────────────────────────
+# Zerodha auto-squares MIS at 3:20-3:25 PM. We square off at 15:10 to stay ahead.
+# If bot misses 15:10, this secondary check at 15:15 ensures we exit before Zerodha.
+EMERGENCY_SQUARE_OFF_TIME = "15:15"
 
 # ── Candle Interval ──────────────────────────────────────────────────
 CANDLE_INTERVAL_MINUTES = 5      # Default candle size for strategy eval

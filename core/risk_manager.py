@@ -172,10 +172,36 @@ class RiskManager:
             entry_price,
             sl_price,
         )
-        required = entry_price * qty * 0.25  # rough MIS margin ~25%
         try:
             margins = self.kite.margins("equity")
             available = margins.get("available", {}).get("live_balance", 0)
+
+            # Try Kite's order margin API for accurate per-stock margin
+            try:
+                order_params = [{
+                    "exchange": settings.EXCHANGE,
+                    "tradingsymbol": "",  # filled by caller context
+                    "transaction_type": "BUY",
+                    "variety": "regular",
+                    "product": settings.PRODUCT_TYPE,
+                    "order_type": settings.ORDER_TYPE,
+                    "quantity": qty,
+                    "price": entry_price,
+                }]
+                margin_info = self.kite.order_margins(order_params)
+                if margin_info and len(margin_info) > 0:
+                    required = margin_info[0].get("total", entry_price * qty * 0.25)
+                    if available < required:
+                        log.warning(
+                            "Margin insufficient: available=%.0f, required=%.0f (Kite API)",
+                            available, required,
+                        )
+                    return available >= required
+            except Exception:
+                pass  # Fallback to estimate below
+
+            # Fallback: conservative 30% estimate (25% was too optimistic for some stocks)
+            required = entry_price * qty * 0.30
             return available >= required
         except Exception:
             log.warning("Margin check failed — blocking trade for safety.")

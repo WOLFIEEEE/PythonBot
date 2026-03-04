@@ -91,17 +91,51 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
     if signal_val == "HOLD":
         return
 
-    entry_price = df.iloc[-1]["close"]
+    # Position reversal: if we have an opposite position, close it first
+    existing_pos = pos_tracker.get_position(symbol)
+    if existing_pos is not None:
+        if existing_pos.direction == signal_val:
+            # Same direction — already in position, skip
+            return
+        # Opposite signal — close existing position before entering new one
+        log.info(
+            "Signal reversal for %s: %s → %s — closing existing position.",
+            symbol, existing_pos.direction, signal_val,
+        )
+        exit_dir = "SELL" if existing_pos.direction == "BUY" else "BUY"
+        # Cancel pending SL/target orders
+        if existing_pos.sl_order_id:
+            order_mgr.cancel_order(existing_pos.sl_order_id)
+        if existing_pos.target_order_id:
+            order_mgr.cancel_order(existing_pos.target_order_id)
+        # Market close
+        close_oid = order_mgr.square_off(symbol, existing_pos.quantity, exit_dir)
+        if close_oid:
+            close_status = order_mgr.wait_for_fill(close_oid, timeout=15)
+            exit_price = order_mgr.get_fill_price(close_oid) if close_status == "COMPLETE" else None
+            exit_price = exit_price or (data_feed.get_ltp(symbol) if data_feed else None) or existing_pos.entry_price
+            trade = pos_tracker.close_position(symbol, exit_price, "SIGNAL_REVERSAL")
+            if trade:
+                risk_mgr.record_trade(trade["net_pnl"])
+                _log_and_notify_exit(trade)
+                _persist_trade(trade)
+
+    raw_price = df.iloc[-1]["close"]
 
     # Validate price sanity
-    if entry_price <= 0 or pd.isna(entry_price):
-        log.warning("Invalid entry price for %s: %s — skipping.", symbol, entry_price)
+    if raw_price <= 0 or pd.isna(raw_price):
+        log.warning("Invalid entry price for %s: %s — skipping.", symbol, raw_price)
         return
 
+    # Apply expected slippage to entry price for conservative risk calculation.
+    # Market orders typically slip — use worse-case estimate for sizing.
+    slippage = settings.SLIPPAGE_PCT / 100
     if signal_val == "BUY":
+        entry_price = round(raw_price * (1 + slippage), 2)  # expect to buy higher
         sl_price = round(entry_price * (1 - settings.SL_PCT / 100), 2)
         target_price = round(entry_price * (1 + settings.TARGET_PCT / 100), 2)
     else:
+        entry_price = round(raw_price * (1 - slippage), 2)  # expect to sell lower
         sl_price = round(entry_price * (1 + settings.SL_PCT / 100), 2)
         target_price = round(entry_price * (1 - settings.TARGET_PCT / 100), 2)
 
@@ -111,6 +145,13 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
     )
     if not ok:
         log.info("Trade blocked for %s: %s", symbol, reason)
+        return
+
+    # Atomically reserve a position slot before placing the order.
+    # This prevents two instruments from both passing MAX_OPEN_POSITIONS
+    # check simultaneously and exceeding the limit.
+    if not pos_tracker.reserve_slot(symbol):
+        log.info("Slot reservation failed for %s (max positions or duplicate).", symbol)
         return
 
     qty = risk_mgr.calculate_quantity(
@@ -123,6 +164,7 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
     # Place entry order
     entry_oid = order_mgr.place_entry_order(symbol, signal_val, qty)
     if not entry_oid:
+        pos_tracker.release_slot(symbol)
         return
 
     # Wait for fill
@@ -131,6 +173,7 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         log.warning("Entry order %s not filled (status=%s).", entry_oid, status)
         if status != "REJECTED":
             order_mgr.cancel_order(entry_oid)
+        pos_tracker.release_slot(symbol)
         return
 
     fill_price = order_mgr.get_fill_price(entry_oid) or entry_price
@@ -221,7 +264,10 @@ def _manage_open_positions(symbol: str) -> None:
             old_sl = pos.trailing_sl
             new_sl = pos_tracker.update_trailing_sl(symbol, ltp)
             if new_sl and pos.sl_order_id:
-                success = order_mgr.modify_sl_order(pos.sl_order_id, new_sl)
+                exit_dir = "SELL" if pos.direction == "BUY" else "BUY"
+                success = order_mgr.modify_sl_order(
+                    pos.sl_order_id, new_sl, direction=exit_dir,
+                )
                 if not success:
                     # Revert: exchange still has the old trigger
                     pos_tracker.revert_trailing_sl(symbol, old_sl)
@@ -334,6 +380,29 @@ def _square_off_all() -> None:
                 risk_mgr.record_trade(trade["net_pnl"])
                 _log_and_notify_exit(trade)
                 _persist_trade(trade)
+
+
+def _emergency_square_off_check() -> None:
+    """
+    Secondary safety net: if any positions remain open after primary square-off
+    at SQUARE_OFF_TIME, force-close them before Zerodha's auto-square at 3:20 PM.
+    Zerodha auto-square-off at 3:20-3:25 uses market orders at worst available price.
+    """
+    if not pos_tracker:
+        return
+    open_positions = pos_tracker.get_open_symbols()
+    if open_positions:
+        log.warning(
+            "EMERGENCY SQUARE-OFF: %d positions still open at %s — "
+            "force-closing before Zerodha auto-square-off at 15:20.",
+            len(open_positions),
+            settings.EMERGENCY_SQUARE_OFF_TIME,
+        )
+        notify_risk_breach(
+            f"Emergency square-off: {len(open_positions)} positions still open "
+            f"at {settings.EMERGENCY_SQUARE_OFF_TIME}"
+        )
+        _square_off_all()
 
 
 def _daily_summary() -> None:
@@ -456,7 +525,7 @@ def main() -> None:
         id="position_sync",
     )
 
-    # Square-off at SQUARE_OFF_TIME
+    # Square-off at SQUARE_OFF_TIME (primary)
     sq_h, sq_m = map(int, settings.SQUARE_OFF_TIME.split(":"))
     scheduler.add_job(
         _square_off_all,
@@ -464,6 +533,16 @@ def main() -> None:
         hour=sq_h,
         minute=sq_m,
         id="square_off",
+    )
+
+    # Emergency square-off: secondary safety net before Zerodha auto-squares at 3:20-3:25
+    esq_h, esq_m = map(int, settings.EMERGENCY_SQUARE_OFF_TIME.split(":"))
+    scheduler.add_job(
+        _emergency_square_off_check,
+        "cron",
+        hour=esq_h,
+        minute=esq_m,
+        id="emergency_square_off",
     )
 
     # Daily summary at MARKET_CLOSE

@@ -26,6 +26,42 @@ class OrderManager:
         self.kite = kite
         # Track pending order IDs to prevent duplicates
         self._pending_orders: dict[str, str] = {}  # symbol -> order_id
+        # Circuit limit cache: {symbol: {"lower": float, "upper": float}}
+        self._circuit_limits: dict[str, dict[str, float]] = {}
+
+    # ── Circuit limit check ───────────────────────────────────────────
+    def is_at_circuit_limit(self, symbol: str, direction: str) -> bool:
+        """
+        Check if instrument is at a circuit limit where orders can't fill.
+        At lower circuit: cannot SELL (no buyers).
+        At upper circuit: cannot BUY (no sellers).
+        """
+        try:
+            ohlc = self.kite.ohlc([f"{settings.EXCHANGE}:{symbol}"])
+            data = ohlc.get(f"{settings.EXCHANGE}:{symbol}", {})
+            ltp = data.get("last_price", 0)
+            lower = data.get("lower_circuit_limit", 0)
+            upper = data.get("upper_circuit_limit", 0)
+
+            if lower and upper and ltp:
+                self._circuit_limits[symbol] = {"lower": lower, "upper": upper}
+                # At lower circuit: selling is blocked
+                if direction == "SELL" and ltp <= lower:
+                    log.warning(
+                        "Circuit limit: %s at lower circuit (LTP=%.2f, LC=%.2f) — SELL blocked.",
+                        symbol, ltp, lower,
+                    )
+                    return True
+                # At upper circuit: buying is blocked
+                if direction == "BUY" and ltp >= upper:
+                    log.warning(
+                        "Circuit limit: %s at upper circuit (LTP=%.2f, UC=%.2f) — BUY blocked.",
+                        symbol, ltp, upper,
+                    )
+                    return True
+        except Exception as exc:
+            log.debug("Circuit limit check failed for %s: %s", symbol, exc)
+        return False
 
     # ── Duplicate check ──────────────────────────────────────────────
     def has_pending_order(self, symbol: str, direction: str) -> bool:
@@ -65,6 +101,11 @@ class OrderManager:
         """
         if self.has_pending_order(symbol, direction):
             log.warning("Duplicate order blocked: %s %s already pending.", direction, symbol)
+            return None
+
+        # Circuit limit check: don't place orders that can't fill
+        if self.is_at_circuit_limit(symbol, direction):
+            notify_order_error(symbol, f"Order blocked: {symbol} at circuit limit for {direction}")
             return None
 
         order_type = settings.ORDER_TYPE
@@ -107,9 +148,25 @@ class OrderManager:
         price: float | None = None,
     ) -> str | None:
         """
-        Place a stop-loss order. direction should be the EXIT side
-        (SELL if long, BUY if short).
+        Place a stop-loss LIMIT order (SL, not SL-M) to prevent slippage.
+
+        SL-M (market) orders on NSE can fill at catastrophic prices during
+        gap-downs or flash crashes. Using SL (limit) with a buffer caps the
+        maximum slippage to SL_BUFFER_PCT beyond the trigger.
+
+        direction = EXIT side (SELL if long, BUY if short).
         """
+        # Calculate limit price with buffer to prevent catastrophic fills
+        buffer = settings.SL_BUFFER_PCT / 100
+        if price is None:
+            # Auto-compute limit price from trigger + buffer
+            if direction == "SELL":
+                # Selling to exit long: limit below trigger
+                price = round(trigger_price * (1 - buffer), 2)
+            else:
+                # Buying to exit short: limit above trigger
+                price = round(trigger_price * (1 + buffer), 2)
+
         params: dict[str, Any] = {
             "variety": "regular",
             "exchange": settings.EXCHANGE,
@@ -117,18 +174,16 @@ class OrderManager:
             "transaction_type": direction,
             "quantity": quantity,
             "product": settings.PRODUCT_TYPE,
-            "order_type": "SL-M",
+            "order_type": "SL",
             "trigger_price": trigger_price,
+            "price": price,
         }
-        if price is not None:
-            params["order_type"] = "SL"
-            params["price"] = price
 
         try:
             order_id = self.kite.place_order(**params)
             log.info(
-                "SL order placed: %s %s trigger=%.2f order_id=%s",
-                direction, symbol, trigger_price, order_id,
+                "SL order placed: %s %s trigger=%.2f limit=%.2f order_id=%s",
+                direction, symbol, trigger_price, price, order_id,
             )
             return order_id
         except (kite_exc.OrderException, kite_exc.InputException) as exc:
@@ -194,22 +249,28 @@ class OrderManager:
         order_id: str,
         new_trigger: float,
         new_price: float | None = None,
+        direction: str = "SELL",
     ) -> bool:
-        """Modify an existing SL order's trigger price."""
+        """Modify an existing SL order's trigger and limit price."""
+        # Always use SL (limit) — never SL-M — to prevent catastrophic fills
+        buffer = settings.SL_BUFFER_PCT / 100
+        if new_price is None:
+            if direction == "SELL":
+                new_price = round(new_trigger * (1 - buffer), 2)
+            else:
+                new_price = round(new_trigger * (1 + buffer), 2)
+
         params: dict[str, Any] = {
             "variety": "regular",
             "order_id": order_id,
             "trigger_price": new_trigger,
+            "price": new_price,
+            "order_type": "SL",
         }
-        if new_price is not None:
-            params["price"] = new_price
-            params["order_type"] = "SL"
-        else:
-            params["order_type"] = "SL-M"
 
         try:
             self.kite.modify_order(**params)
-            log.info("SL order %s modified — new trigger=%.2f", order_id, new_trigger)
+            log.info("SL order %s modified — trigger=%.2f limit=%.2f", order_id, new_trigger, new_price)
             return True
         except (kite_exc.OrderException, kite_exc.InputException) as exc:
             log.error("SL modify failed (order %s): %s", order_id, exc)
