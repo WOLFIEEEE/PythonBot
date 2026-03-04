@@ -13,6 +13,11 @@ import pandas as pd
 
 from config import settings
 from core.strategy import BaseStrategy
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+MIN_CANDLES = settings.SUPERTREND_PERIOD + 5
 
 
 def _compute_supertrend(
@@ -65,20 +70,26 @@ class SupertrendStrategy(BaseStrategy):
 
     def generate_signal(self) -> str:
         df = self.df
-        if len(df) < settings.SUPERTREND_PERIOD + 2:
+        if len(df) < MIN_CANDLES:
             return "HOLD"
 
         prev = df.iloc[-2]
         curr = df.iloc[-1]
 
+        # Guard against NaN
         if pd.isna(curr.get("supertrend")) or pd.isna(prev.get("supertrend")):
             return "HOLD"
+        if pd.isna(curr.get("st_direction")) or pd.isna(prev.get("st_direction")):
+            return "HOLD"
 
-        # Crossover: direction changed from -1 to 1 → BUY
-        if prev["st_direction"] == -1 and curr["st_direction"] == 1:
+        prev_dir = int(prev["st_direction"])
+        curr_dir = int(curr["st_direction"])
+
+        # Crossover: direction changed from -1 to 1 -> BUY
+        if prev_dir == -1 and curr_dir == 1:
             return "BUY"
-        # Crossover: direction changed from 1 to -1 → SELL
-        if prev["st_direction"] == 1 and curr["st_direction"] == -1:
+        # Crossover: direction changed from 1 to -1 -> SELL
+        if prev_dir == 1 and curr_dir == -1:
             return "SELL"
 
         return "HOLD"

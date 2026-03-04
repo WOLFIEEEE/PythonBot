@@ -1,6 +1,9 @@
 """
 Main orchestrator — authentication, data feed, strategy evaluation,
 order lifecycle, risk management, and scheduled square-off.
+
+Hardened with: market-day check, thread safety, emergency exits,
+external close detection, stale data skipping.
 """
 
 from __future__ import annotations
@@ -28,16 +31,18 @@ from strategies.vwap_breakout import VWAPBreakoutStrategy
 from utils import db
 from utils.helpers import (
     build_instrument_map,
+    is_market_day,
     is_market_open,
     is_past_square_off_time,
     now_ist,
     resolve_tokens,
-    retry,
 )
 from utils.logger import get_logger
 from utils.notifier import (
     notify_bot_status,
     notify_daily_summary,
+    notify_order_error,
+    notify_risk_breach,
     notify_trade_entry,
     notify_trade_exit,
 )
@@ -54,6 +59,9 @@ strategy_engine: StrategyEngine | None = None
 scheduler: BackgroundScheduler | None = None
 shutdown_event = threading.Event()
 
+# Lock to prevent concurrent signal processing for the same instrument
+_signal_lock = threading.Lock()
+
 
 # ── Strategy callback (fired on each new candle) ─────────────────────
 def on_new_candle(symbol: str, df: pd.DataFrame) -> None:
@@ -65,11 +73,17 @@ def on_new_candle(symbol: str, df: pd.DataFrame) -> None:
     if is_past_square_off_time():
         return
 
-    try:
-        _process_signal(symbol, df)
-        _manage_open_positions(symbol)
-    except Exception:
-        log.exception("Error processing candle for %s", symbol)
+    # Skip if data is stale (no recent ticks)
+    if data_feed and data_feed.is_data_stale(symbol):
+        log.warning("Stale data for %s — skipping signal evaluation.", symbol)
+        return
+
+    with _signal_lock:
+        try:
+            _process_signal(symbol, df)
+            _manage_open_positions(symbol)
+        except Exception:
+            log.exception("Error processing candle for %s", symbol)
 
 
 def _process_signal(symbol: str, df: pd.DataFrame) -> None:
@@ -78,6 +92,12 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         return
 
     entry_price = df.iloc[-1]["close"]
+
+    # Validate price sanity
+    if entry_price <= 0 or pd.isna(entry_price):
+        log.warning("Invalid entry price for %s: %s — skipping.", symbol, entry_price)
+        return
+
     if signal_val == "BUY":
         sl_price = round(entry_price * (1 - settings.SL_PCT / 100), 2)
         target_price = round(entry_price * (1 + settings.TARGET_PCT / 100), 2)
@@ -85,8 +105,10 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         sl_price = round(entry_price * (1 + settings.SL_PCT / 100), 2)
         target_price = round(entry_price * (1 - settings.TARGET_PCT / 100), 2)
 
-    # Pre-trade checks
-    ok, reason = risk_mgr.pre_trade_checks(symbol, pos_tracker, entry_price, sl_price)
+    # Pre-trade checks (now includes volatility filter with candle data)
+    ok, reason = risk_mgr.pre_trade_checks(
+        symbol, pos_tracker, entry_price, sl_price, candle_df=df
+    )
     if not ok:
         log.info("Trade blocked for %s: %s", symbol, reason)
         return
@@ -107,7 +129,8 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
     status = order_mgr.wait_for_fill(entry_oid, timeout=30)
     if status != "COMPLETE":
         log.warning("Entry order %s not filled (status=%s).", entry_oid, status)
-        order_mgr.cancel_order(entry_oid)
+        if status != "REJECTED":
+            order_mgr.cancel_order(entry_oid)
         return
 
     fill_price = order_mgr.get_fill_price(entry_oid) or entry_price
@@ -122,8 +145,14 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
         target_price = round(fill_price * (1 - settings.TARGET_PCT / 100), 2)
         exit_dir = "BUY"
 
-    # Place SL and target orders
+    # Place SL order — CRITICAL: if this fails, emergency exit
     sl_oid = order_mgr.place_sl_order(symbol, exit_dir, qty, sl_price)
+    if sl_oid is None:
+        log.error("SL placement failed for %s — initiating emergency exit.", symbol)
+        order_mgr.emergency_exit(symbol, exit_dir, qty)
+        return
+
+    # Place target order (non-critical — position is still protected by SL)
     tgt_oid = order_mgr.place_target_order(symbol, exit_dir, qty, target_price)
 
     # Track the position
@@ -149,7 +178,7 @@ def _process_signal(symbol: str, df: pd.DataFrame) -> None:
 
 def _manage_open_positions(symbol: str) -> None:
     """Check SL/target fills, update trailing SL for an open position."""
-    pos = pos_tracker.positions.get(symbol)
+    pos = pos_tracker.get_position(symbol)
     if pos is None:
         return
 
@@ -232,25 +261,45 @@ def _heartbeat() -> None:
         log.debug("Heartbeat OK.")
     except Exception as exc:
         log.error("Heartbeat failed: %s", exc)
+        notify_order_error("SYSTEM", f"Heartbeat failed: {exc}")
 
 
 def _sync_positions() -> None:
-    """Reconcile positions with Kite."""
-    if pos_tracker:
-        # Build live prices from data feed
-        live_prices: dict[str, float] = {}
-        if data_feed:
-            for sym in pos_tracker.positions:
-                ltp = data_feed.get_ltp(sym)
-                if ltp:
-                    live_prices[sym] = ltp
-        pos_tracker.update_unrealized_pnl(live_prices)
-        pos_tracker.sync_with_kite()
+    """Reconcile positions with Kite and handle external closes."""
+    if not pos_tracker:
+        return
 
-        # Check daily loss circuit breaker
-        if risk_mgr and risk_mgr.should_stop_trading(pos_tracker):
-            log.warning("DAILY LOSS LIMIT HIT — squaring off everything.")
-            _square_off_all()
+    # Build live prices from data feed
+    live_prices: dict[str, float] = {}
+    if data_feed:
+        for sym in pos_tracker.get_open_symbols():
+            ltp = data_feed.get_ltp(sym)
+            if ltp:
+                live_prices[sym] = ltp
+    pos_tracker.update_unrealized_pnl(live_prices)
+
+    # Detect externally closed positions
+    externally_closed = pos_tracker.sync_with_kite()
+    for sym in externally_closed:
+        ltp = live_prices.get(sym)
+        pos = pos_tracker.get_position(sym)
+        if pos and ltp:
+            # Cancel any pending SL/target orders
+            if pos.sl_order_id:
+                order_mgr.cancel_order(pos.sl_order_id)
+            if pos.target_order_id:
+                order_mgr.cancel_order(pos.target_order_id)
+            trade = pos_tracker.close_position(sym, ltp, "EXTERNAL_CLOSE")
+            if trade:
+                risk_mgr.record_trade(trade["net_pnl"])
+                _log_and_notify_exit(trade)
+                _persist_trade(trade)
+
+    # Check daily loss circuit breaker
+    if risk_mgr and risk_mgr.should_stop_trading(pos_tracker):
+        log.warning("DAILY LOSS LIMIT HIT — squaring off everything.")
+        notify_risk_breach("Daily loss limit hit — squaring off all positions.")
+        _square_off_all()
 
 
 def _square_off_all() -> None:
@@ -262,9 +311,13 @@ def _square_off_all() -> None:
 
     # Close positions in tracker
     if pos_tracker and data_feed:
-        for sym in list(pos_tracker.positions.keys()):
-            ltp = data_feed.get_ltp(sym) or pos_tracker.positions[sym].entry_price
-            trade = pos_tracker.close_position(sym, ltp, "SQUARE_OFF")
+        for sym in pos_tracker.get_open_symbols():
+            ltp = data_feed.get_ltp(sym)
+            pos = pos_tracker.get_position(sym)
+            if not pos:
+                continue
+            exit_price = ltp or pos.entry_price
+            trade = pos_tracker.close_position(sym, exit_price, "SQUARE_OFF")
             if trade:
                 risk_mgr.record_trade(trade["net_pnl"])
                 _log_and_notify_exit(trade)
@@ -300,7 +353,9 @@ def _daily_summary() -> None:
 
 # ── Shutdown ─────────────────────────────────────────────────────────
 def _graceful_shutdown(signum=None, frame=None) -> None:
-    log.info("Shutdown signal received — cleaning up…")
+    if shutdown_event.is_set():
+        return  # Prevent double shutdown
+    log.info("Shutdown signal received — cleaning up...")
     shutdown_event.set()
 
     _square_off_all()
@@ -321,15 +376,21 @@ def main() -> None:
     global kite, order_mgr, risk_mgr, pos_tracker, data_feed
     global strategy_engine, scheduler
 
+    # 0. Market day check
+    if not is_market_day():
+        log.info("Today is not a trading day (weekend). Exiting.")
+        print("Today is not a trading day (weekend). Exiting.")
+        return
+
     # 1. Init database
     db.init_db()
 
     # 2. Authenticate
-    log.info("Authenticating with Kite Connect…")
+    log.info("Authenticating with Kite Connect...")
     kite = authenticate()
 
     # 3. Fetch instruments & resolve tokens
-    log.info("Fetching instrument list…")
+    log.info("Fetching instrument list...")
     instrument_map = build_instrument_map(kite)
     token_map = resolve_tokens(instrument_map, settings.WATCHLIST)
     if not token_map:

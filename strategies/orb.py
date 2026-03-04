@@ -1,7 +1,7 @@
 """
 Opening Range Breakout (ORB) strategy.
 
-Capture the high/low of the first 15-minute candle (9:15–9:30).
+Capture the high/low of the first 15-minute candle (9:15-9:30).
 BUY:  Price breaks above ORB high with volume confirmation.
 SELL: Price breaks below ORB low with volume confirmation.
 SL at the opposite end of the ORB range.
@@ -9,10 +9,24 @@ SL at the opposite end of the ORB range.
 
 from __future__ import annotations
 
+from datetime import time as dt_time
+
 import pandas as pd
 
 from config import settings
 from core.strategy import BaseStrategy
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+# Don't trade ORB breakout within the opening range itself
+_ORB_END_MIN = 15 + settings.ORB_CANDLE_MINUTES
+_ORB_END_HOUR = 9 + _ORB_END_MIN // 60
+_ORB_END_MIN = _ORB_END_MIN % 60
+ORB_END_TIME = dt_time(_ORB_END_HOUR, _ORB_END_MIN)
+
+# Minimum candle width to avoid noise breakouts (0.1% of price)
+MIN_ORB_RANGE_PCT = 0.1
 
 
 class ORBStrategy(BaseStrategy):
@@ -28,20 +42,13 @@ class ORBStrategy(BaseStrategy):
         if df.empty:
             return
 
-        # Identify the opening range candle(s) — first ORB_CANDLE_MINUTES
-        # We assume candle timestamps are timezone-naive IST
+        # Identify the opening range candle(s)
         opening_candles = []
         for ts in df.index:
             t = ts.time() if hasattr(ts, "time") else None
             if t is None:
                 continue
-            from datetime import time as dt_time
-            orb_end_hour = 9
-            orb_end_min = 15 + settings.ORB_CANDLE_MINUTES
-            if orb_end_min >= 60:
-                orb_end_hour += orb_end_min // 60
-                orb_end_min = orb_end_min % 60
-            if t < dt_time(orb_end_hour, orb_end_min):
+            if t < ORB_END_TIME:
                 opening_candles.append(ts)
 
         if not opening_candles:
@@ -58,6 +65,12 @@ class ORBStrategy(BaseStrategy):
         if self._orb_high is None or self._orb_low is None:
             return "HOLD"
 
+        # Validate ORB range is meaningful (not too narrow)
+        orb_range = self._orb_high - self._orb_low
+        mid_price = (self._orb_high + self._orb_low) / 2
+        if mid_price > 0 and (orb_range / mid_price * 100) < MIN_ORB_RANGE_PCT:
+            return "HOLD"
+
         df = self.df
         if len(df) < 3:
             return "HOLD"
@@ -65,7 +78,14 @@ class ORBStrategy(BaseStrategy):
         curr = df.iloc[-1]
         prev = df.iloc[-2]
 
-        vol_ok = curr["volume"] > 1.2 * curr.get("vol_avg", 0) if curr.get("vol_avg", 0) > 0 else True
+        # Don't signal during the opening range period
+        curr_time = curr.name.time() if hasattr(curr.name, "time") else None
+        if curr_time is not None and curr_time < ORB_END_TIME:
+            return "HOLD"
+
+        # Guard against NaN volume
+        vol_avg = curr.get("vol_avg", 0)
+        vol_ok = curr["volume"] > 1.2 * vol_avg if vol_avg > 0 else False
 
         # Breakout above ORB high
         if prev["close"] <= self._orb_high and curr["close"] > self._orb_high and vol_ok:

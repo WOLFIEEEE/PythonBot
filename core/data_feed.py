@@ -1,5 +1,6 @@
 """
 WebSocket ticker for live market data with real-time candle aggregation.
+Includes tick validation and stale data detection.
 """
 
 from __future__ import annotations
@@ -21,6 +22,9 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
+# If no tick received for an instrument in this many seconds, consider data stale
+STALE_THRESHOLD_SECONDS = 120
+
 
 class CandleAggregator:
     """Aggregates ticks into fixed-interval OHLCV candles."""
@@ -36,11 +40,13 @@ class CandleAggregator:
         # Per-instrument state
         self._current: dict[str, dict[str, Any]] = {}
         self._candles: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._last_tick_time: dict[str, datetime] = {}
 
     def _floor_time(self, dt: datetime) -> datetime:
         """Floor datetime to the candle interval boundary."""
-        minutes = (dt.hour * 60 + dt.minute)
-        floored = minutes - (minutes % (self.interval.seconds // 60))
+        minutes = dt.hour * 60 + dt.minute
+        interval_min = max(1, self.interval.seconds // 60)
+        floored = minutes - (minutes % interval_min)
         return dt.replace(
             hour=floored // 60,
             minute=floored % 60,
@@ -53,11 +59,20 @@ class CandleAggregator:
         Process a tick. Returns the finalized candle dict if a candle just
         closed, else None.
         """
-        ltp = tick.get("last_price", 0)
+        ltp = tick.get("last_price")
+        if ltp is None or ltp <= 0:
+            return None  # Invalid tick — skip
+
         volume = tick.get("volume_traded", 0)
         ts = tick.get("exchange_timestamp") or datetime.now()
-        candle_start = self._floor_time(ts)
 
+        # Validate timestamp is not far in the future
+        now = datetime.now()
+        if hasattr(ts, "tzinfo") and ts.tzinfo:
+            now = ts  # use exchange time
+        self._last_tick_time[symbol] = now
+
+        candle_start = self._floor_time(ts)
         cur = self._current.get(symbol)
 
         if cur is None or cur["timestamp"] != candle_start:
@@ -103,6 +118,18 @@ class CandleAggregator:
     def get_current_candle(self, symbol: str) -> dict[str, Any] | None:
         return self._current.get(symbol)
 
+    def is_data_stale(self, symbol: str) -> bool:
+        """Check if we haven't received a tick for too long."""
+        last = self._last_tick_time.get(symbol)
+        if last is None:
+            return True
+        elapsed = (datetime.now() - last).total_seconds()
+        return elapsed > STALE_THRESHOLD_SECONDS
+
+    def get_candle_count(self, symbol: str) -> int:
+        """Number of completed candles for a symbol."""
+        return len(self._candles[symbol])
+
 
 class DataFeed:
     """
@@ -128,6 +155,7 @@ class DataFeed:
 
         self._ticker: KiteTicker | None = None
         self._thread: threading.Thread | None = None
+        self._connected = threading.Event()
 
     # ── Callbacks ────────────────────────────────────────────────────
     def _on_ticks(self, ws: Any, ticks: list[dict]) -> None:
@@ -149,16 +177,18 @@ class DataFeed:
         tokens = list(self.token_symbol_map.keys())
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_FULL, tokens)
+        self._connected.set()
         log.info("WebSocket connected — subscribed to %d tokens.", len(tokens))
 
     def _on_close(self, ws: Any, code: int, reason: str) -> None:
+        self._connected.clear()
         log.warning("WebSocket closed (code=%s, reason=%s).", code, reason)
 
     def _on_error(self, ws: Any, code: int, reason: str) -> None:
         log.error("WebSocket error (code=%s, reason=%s).", code, reason)
 
     def _on_reconnect(self, ws: Any, attempts: int) -> None:
-        log.info("WebSocket reconnecting (attempt %d)…", attempts)
+        log.info("WebSocket reconnecting (attempt %d)...", attempts)
 
     # ── Public API ───────────────────────────────────────────────────
     def start(self) -> None:
@@ -177,7 +207,12 @@ class DataFeed:
     def stop(self) -> None:
         if self._ticker:
             self._ticker.close()
+            self._connected.clear()
             log.info("DataFeed stopped.")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected.is_set()
 
     def get_dataframe(self, symbol: str) -> pd.DataFrame:
         return self.aggregator.get_dataframe(symbol)
@@ -185,3 +220,6 @@ class DataFeed:
     def get_ltp(self, symbol: str) -> float | None:
         cur = self.aggregator.get_current_candle(symbol)
         return cur["close"] if cur else None
+
+    def is_data_stale(self, symbol: str) -> bool:
+        return self.aggregator.is_data_stale(symbol)

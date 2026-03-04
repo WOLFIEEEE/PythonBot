@@ -1,11 +1,14 @@
 """
-Risk management — position sizing, pre-trade checks, circuit breakers.
+Risk management — position sizing, pre-trade checks, circuit breakers,
+volatility filter, exposure caps.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
+
+import pandas as pd
 
 from config import settings
 from utils.helpers import is_past_no_new_trades_time, now_ist, retry
@@ -19,6 +22,9 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+# Maximum percentage of capital that can be deployed across all positions
+MAX_TOTAL_EXPOSURE_PCT = 80.0
+
 
 class RiskManager:
     """Pre-trade gatekeeper and intraday risk controls."""
@@ -29,6 +35,8 @@ class RiskManager:
         self.trades_today = 0
         self.consecutive_losses = 0
         self._paused_until: datetime | None = None
+        # Track per-instrument ATR for volatility filtering
+        self._atr_history: dict[str, list[float]] = {}
 
     # ── Position sizing ──────────────────────────────────────────────
     @staticmethod
@@ -52,6 +60,7 @@ class RiskManager:
         position_tracker: PositionTracker,
         entry_price: float,
         sl_price: float,
+        candle_df: pd.DataFrame | None = None,
     ) -> tuple[bool, str]:
         """
         Run all pre-trade validations.
@@ -90,7 +99,69 @@ class RiskManager:
         if self._paused_until and now_ist() < self._paused_until:
             return False, f"Paused until {self._paused_until.strftime('%H:%M')} (consecutive losses)."
 
+        # 8 — Total exposure cap
+        qty = self.calculate_quantity(
+            self.starting_capital, settings.RISK_PER_TRADE_PCT,
+            entry_price, sl_price,
+        )
+        current_exposure = sum(
+            p.entry_price * p.quantity for p in position_tracker.positions.values()
+        )
+        new_exposure = current_exposure + (entry_price * qty)
+        max_exposure = self.starting_capital * MAX_TOTAL_EXPOSURE_PCT / 100
+        if new_exposure > max_exposure:
+            return False, (
+                f"Total exposure would exceed {MAX_TOTAL_EXPOSURE_PCT}% cap "
+                f"({new_exposure:.0f} > {max_exposure:.0f})."
+            )
+
+        # 9 — Volatility filter (skip if ATR > 2x 20-period average)
+        if candle_df is not None and not candle_df.empty:
+            blocked, reason = self._volatility_filter(symbol, candle_df)
+            if blocked:
+                return False, reason
+
+        # 10 — Minimum SL distance sanity check
+        sl_distance_pct = abs(entry_price - sl_price) / entry_price * 100
+        if sl_distance_pct < 0.05:
+            return False, f"SL too tight ({sl_distance_pct:.3f}%) — likely bad data."
+        if sl_distance_pct > 5.0:
+            return False, f"SL too wide ({sl_distance_pct:.1f}%) — excessive risk."
+
         return True, "OK"
+
+    # ── Volatility filter ────────────────────────────────────────────
+    def _volatility_filter(
+        self, symbol: str, df: pd.DataFrame
+    ) -> tuple[bool, str]:
+        """
+        Block trade if current ATR is > 2x the 20-period average ATR.
+        Returns (blocked: bool, reason: str).
+        """
+        if len(df) < 21:
+            return False, ""
+
+        tr1 = df["high"] - df["low"]
+        tr2 = (df["high"] - df["close"].shift()).abs()
+        tr3 = (df["low"] - df["close"].shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr_series = tr.rolling(14).mean()
+
+        current_atr = atr_series.iloc[-1]
+        avg_atr = atr_series.iloc[-21:-1].mean()
+
+        if pd.isna(current_atr) or pd.isna(avg_atr) or avg_atr == 0:
+            return False, ""
+
+        if current_atr > 2.0 * avg_atr:
+            reason = (
+                f"Volatility too high for {symbol}: "
+                f"ATR={current_atr:.2f} > 2x avg ATR={avg_atr:.2f}"
+            )
+            log.warning(reason)
+            return True, reason
+
+        return False, ""
 
     # ── Margin helper ────────────────────────────────────────────────
     @retry(max_retries=2, exceptions=(Exception,))
@@ -107,8 +178,8 @@ class RiskManager:
             available = margins.get("available", {}).get("live_balance", 0)
             return available >= required
         except Exception:
-            log.warning("Margin check failed — allowing trade cautiously.")
-            return True
+            log.warning("Margin check failed — blocking trade for safety.")
+            return False
 
     # ── Record trade outcome ─────────────────────────────────────────
     def record_trade(self, pnl: float) -> None:
@@ -117,7 +188,6 @@ class RiskManager:
             self.consecutive_losses += 1
             if self.consecutive_losses >= settings.CONSECUTIVE_LOSS_PAUSE_THRESHOLD:
                 pause_until = now_ist().replace(second=0, microsecond=0)
-                from datetime import timedelta
                 pause_until += timedelta(minutes=settings.CONSECUTIVE_LOSS_PAUSE_MINUTES)
                 self._paused_until = pause_until
                 msg = (

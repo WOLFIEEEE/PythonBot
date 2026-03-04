@@ -11,6 +11,12 @@ import numpy as np
 import pandas as pd
 
 from core.strategy import BaseStrategy
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+# Need at least 16 candles for RSI warmup + 3-candle confirmation
+MIN_CANDLES = 18
 
 
 class VWAPBreakoutStrategy(BaseStrategy):
@@ -36,12 +42,18 @@ class VWAPBreakoutStrategy(BaseStrategy):
 
     def generate_signal(self) -> str:
         df = self.df
-        if len(df) < 16:
+        if len(df) < MIN_CANDLES:
             return "HOLD"
 
         last3 = df.iloc[-3:]
         curr = df.iloc[-1]
         rsi = curr.get("rsi", 50)
+
+        # Guard against NaN
+        if pd.isna(rsi):
+            return "HOLD"
+        if last3["vwap"].isna().any() or last3["close"].isna().any():
+            return "HOLD"
 
         above = all(last3["close"] > last3["vwap"])
         below = all(last3["close"] < last3["vwap"])

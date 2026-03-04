@@ -1,5 +1,6 @@
 """
 Order placement, modification, cancellation, and lifecycle management.
+Includes emergency exit logic when SL placement fails.
 """
 
 from __future__ import annotations
@@ -23,6 +24,28 @@ class OrderManager:
 
     def __init__(self, kite: KiteConnect):
         self.kite = kite
+        # Track pending order IDs to prevent duplicates
+        self._pending_orders: dict[str, str] = {}  # symbol -> order_id
+
+    # ── Duplicate check ──────────────────────────────────────────────
+    def has_pending_order(self, symbol: str, direction: str) -> bool:
+        """Check if there's already a pending order for this instrument+direction."""
+        key = f"{symbol}_{direction}"
+        oid = self._pending_orders.get(key)
+        if oid is None:
+            return False
+        try:
+            status = self.get_order_status(oid)
+            if status in ("COMPLETE", "REJECTED", "CANCELLED"):
+                del self._pending_orders[key]
+                return False
+            return True  # still OPEN or TRIGGER PENDING
+        except Exception:
+            del self._pending_orders[key]
+            return False
+
+    def _track_order(self, symbol: str, direction: str, order_id: str) -> None:
+        self._pending_orders[f"{symbol}_{direction}"] = order_id
 
     # ── Place entry ──────────────────────────────────────────────────
     @retry(
@@ -38,7 +61,12 @@ class OrderManager:
     ) -> str | None:
         """
         Place an entry order (MARKET or LIMIT). Returns order_id or None.
+        Blocks duplicates for the same symbol+direction.
         """
+        if self.has_pending_order(symbol, direction):
+            log.warning("Duplicate order blocked: %s %s already pending.", direction, symbol)
+            return None
+
         order_type = settings.ORDER_TYPE
         params: dict[str, Any] = {
             "variety": "regular",
@@ -58,6 +86,7 @@ class OrderManager:
                 "Entry order placed: %s %s qty=%d order_id=%s",
                 direction, symbol, quantity, order_id,
             )
+            self._track_order(symbol, direction, order_id)
             return order_id
         except (kite_exc.OrderException, kite_exc.InputException) as exc:
             log.error("Entry order failed for %s: %s", symbol, exc)
@@ -104,7 +133,7 @@ class OrderManager:
             return order_id
         except (kite_exc.OrderException, kite_exc.InputException) as exc:
             log.error("SL order failed for %s: %s", symbol, exc)
-            notify_order_error(symbol, str(exc))
+            notify_order_error(symbol, f"SL PLACEMENT FAILED: {exc}")
             return None
 
     # ── Place target ─────────────────────────────────────────────────
@@ -141,6 +170,19 @@ class OrderManager:
             log.error("Target order failed for %s: %s", symbol, exc)
             notify_order_error(symbol, str(exc))
             return None
+
+    # ── Emergency exit ───────────────────────────────────────────────
+    def emergency_exit(self, symbol: str, quantity: int, direction: str) -> str | None:
+        """
+        Immediately market-close a position. Used when SL order placement
+        fails — we must not hold an unprotected position.
+        """
+        log.error(
+            "EMERGENCY EXIT: %s %s qty=%d — SL could not be placed.",
+            direction, symbol, quantity,
+        )
+        notify_order_error(symbol, "EMERGENCY EXIT — SL placement failed, closing position immediately")
+        return self.place_entry_order(symbol, direction, quantity)
 
     # ── Modify SL (trailing) ─────────────────────────────────────────
     @retry(
@@ -260,3 +302,4 @@ class OrderManager:
             status = order.get("status", "")
             if status in ("OPEN", "TRIGGER PENDING"):
                 self.cancel_order(order["order_id"])
+        self._pending_orders.clear()
